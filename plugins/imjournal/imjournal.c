@@ -630,6 +630,9 @@ loadJournalState(void)
 						iRet = RS_RET_ERR;
 					}
 				}
+				if (tmp_cursor) {
+					free(tmp_cursor);
+				}
 			}
 		} else {
 			LogError(0, RS_RET_IO_ERROR, "imjournal: "
