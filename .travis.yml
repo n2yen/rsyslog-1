@@ -91,5 +91,6 @@ matrix:
        dist: trusty
        env: RUN="run-cron.sh",DO_COVERITY="YES",DO_CRON="YES", KAFKA="YES", GROK="YES"
 
+
 script:
    - devtools/ci/travis/do-run.sh

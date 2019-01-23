@@ -761,6 +761,13 @@ endif
 endif
 endif
 
+if ENABLE_IMDOCKER
+if ENABLE_IMDOCKER_TESTS
+TESTS += \
+	imdocker-unittests.sh
+endif
+endif
+
 if ENABLE_IMPSTATS
 TESTS +=  \
 	impstats-hup.sh \
@@ -2056,6 +2063,7 @@ EXTRA_DIST= \
 	mmkubernetes_test_server.py \
 	mmkubernetes-basic.out.json \
 	es-writeoperation.sh \
+	imdocker-unittests.sh \
 	testsuites/incltest.d/include.conf \
 	testsuites/abort-uncleancfg-goodcfg.conf \
 	testsuites/include-std-omfile-action.conf \
