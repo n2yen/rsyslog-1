@@ -34,6 +34,7 @@
 #include <json.h>
 #include <assert.h>
 #include <signal.h>
+#include <stdbool.h>
 #include "cfsysline.h"  /* access to config file objects */
 #include "unicode-helper.h"
 #include "module-template.h"
@@ -73,6 +74,7 @@ extern int Debug;
 
 /* DEFAULT VALUES */
 #define DFLT_pollingInterval   60      /* polling interval in seconds */
+#define DFLT_retrieveNewLogsFromStart 1/* Process newly found containers logs from start */
 #define DFLT_containersLimit   25      /* maximum number of containers */
 #define DFLT_trimLineOverBytes 4194304 /* limit log lines to the value - 4MB default */
 
@@ -164,8 +166,8 @@ dockerContLogsInstNew(docker_cont_logs_inst_t **ppThis, const char* id,
 		docker_container_info_t *container_info, SubmitMsgFuncPtr submitMsg);
 
 static void dockerContLogsInstDestruct(docker_cont_logs_inst_t *pThis);
-static rsRetVal dockerContLogsInstSetUrlById (docker_cont_logs_inst_t *pThis, CURLM *curlm,
-		const char* containerId);
+static rsRetVal dockerContLogsInstSetUrlById (sbool isInit, docker_cont_logs_inst_t *pThis,
+		CURLM *curlm, const char* containerId);
 
 /* docker_cont_log_instances_t */
 static rsRetVal dockerContLogReqsNew(docker_cont_log_instances_t **ppThis);
@@ -215,33 +217,19 @@ const char* DFLT_dockerAPIAdd           = "http://localhost:2375";
 const char* DFLT_apiVersionStr          = "v1.27";
 const char* DFLT_listContainersOptions  = "";
 const char* DFLT_getContainerLogOptions = "timestamps=0&follow=1&stdout=1&stderr=1&tail=1";
-
-/* config vars for the legacy config system */
-static struct configSettings_s {
-	int       iFacility;
-	int       iSeverity;
-	/* Docker API urls */
-	uchar     *apiVersionStr;
-	uchar     *listContainersOptions;
-	uchar     *getContainerLogOptions;
-	int       iPollInterval;  /* in seconds */
-	uchar     *dockerApiUnixSockAddr;
-	uchar     *dockerApiAddr;
-	int       containersLimit;
-	int       trimLineOverBytes;
-} cs;
+const char* DFLT_getContainerLogOptionsWithoutTail = "timestamps=0&follow=1&stdout=1&stderr=1";
 
 /* Overall module configuration structure here. */
 struct modConfData_s {
 	rsconf_t *pConf;  /* our overall config object */
-	int      iFacility;
-	int      iSeverity;
 	uchar    *apiVersionStr;
 	uchar    *listContainersOptions;
 	uchar    *getContainerLogOptions;
+	uchar    *getContainerLogOptionsWithoutTail;
 	int      iPollInterval;  /* in seconds */
 	uchar    *dockerApiUnixSockAddr;
 	uchar    *dockerApiAddr;
+	sbool    retrieveNewLogsFromStart;
 	int      containersLimit;
 	int      trimLineOverBytes;
 };
@@ -262,6 +250,7 @@ static struct cnfparamdescr modpdescr[] = {
 	{ "listcontainersoptions", eCmdHdlrString, 0 },
 	{ "getcontainerlogoptions", eCmdHdlrString, 0 },
 	{ "pollinginterval", eCmdHdlrPositiveInt, 0 },
+	{ "retrievenewlogsfromstart", eCmdHdlrBinary, 0 },
 	{ "trimlineoverbytes", eCmdHdlrPositiveInt, 0 },
 	{ "ruleset", eCmdHdlrString, 0 }
 };
@@ -328,7 +317,7 @@ dockerContLogsBufWrite(docker_cont_logs_buf_t *pThis, const uchar *pdata, size_t
 	DEFiRet;
 
 	imdocker_buf_t *mem = pThis->buf;
-	if (mem->len + write_size > mem->data_size) {
+	if (mem->len + write_size + 1 > mem->data_size) {
 		uchar *pbuf=NULL;
 		if ((pbuf = realloc(mem->data, mem->len + write_size + 1)) == NULL) {
 			LogError(errno, RS_RET_ERR, "%s() - realloc failed!\n", __FUNCTION__);
@@ -559,10 +548,14 @@ finalize_it:
 }
 
 static rsRetVal
-dockerContLogsInstSetUrlById (docker_cont_logs_inst_t *pThis, CURLM *curlm,
+dockerContLogsInstSetUrlById (sbool isInit, docker_cont_logs_inst_t *pThis, CURLM *curlm,
 		const char* containerId) {
 	char url[256];
-	const uchar* container_log_options = runModConf->getContainerLogOptions;
+	const uchar* container_log_options = runModConf->getContainerLogOptionsWithoutTail;
+
+	if (isInit || !runModConf->retrieveNewLogsFromStart) {
+		container_log_options = runModConf->getContainerLogOptions;
+	}
 
 	const uchar* pApiAddr = (uchar*)"http:";
 	if (runModConf->dockerApiAddr) {
@@ -659,9 +652,9 @@ dockerContLogReqsPrint(docker_cont_log_instances_t *pThis) {
 	count = hashtable_count(pThis->ht_container_log_insts);
 	if (count) {
 		int ret = 0;
-		struct hashtable_itr *itr = NULL;
+		struct hashtable_itr *itr = hashtable_iterator(pThis->ht_container_log_insts);
+
 		dbgprintf("%s() - All container instances, count=%d...\n", __FUNCTION__, count);
-		itr = hashtable_iterator(pThis->ht_container_log_insts);
 		do {
 			docker_cont_logs_inst_t *pObj = hashtable_iterator_value(itr);
 			dockerContLogsInstPrint(pObj);
@@ -750,6 +743,7 @@ CODESTARTbeginCnfLoad
 
 	/* init our settings */
 	loadModConf->iPollInterval     = DFLT_pollingInterval; /* in seconds */
+	loadModConf->retrieveNewLogsFromStart  = DFLT_retrieveNewLogsFromStart;
 	loadModConf->containersLimit   = DFLT_containersLimit;
 	loadModConf->trimLineOverBytes = DFLT_trimLineOverBytes;
 
@@ -759,18 +753,7 @@ CODESTARTbeginCnfLoad
 	loadModConf->dockerApiAddr          = NULL;
 	loadModConf->listContainersOptions  = NULL;
 	loadModConf->getContainerLogOptions = NULL;
-
-	/* init legacy config vars */
-	cs.iFacility              = 0;
-	cs.iSeverity              = 0;
-	cs.iPollInterval          = loadModConf->iPollInterval;	/* in seconds */
-	cs.containersLimit        = loadModConf->containersLimit;
-	cs.trimLineOverBytes      = loadModConf->trimLineOverBytes;
-	cs.dockerApiUnixSockAddr  = loadModConf->dockerApiUnixSockAddr;
-	cs.dockerApiAddr          = loadModConf->dockerApiAddr;
-	cs.apiVersionStr          = loadModConf->apiVersionStr;
-	cs.listContainersOptions  = loadModConf->listContainersOptions;
-	cs.getContainerLogOptions = loadModConf->getContainerLogOptions;
+	loadModConf->getContainerLogOptionsWithoutTail = NULL;
 ENDbeginCnfLoad
 
 BEGINsetModCnf
@@ -804,12 +787,40 @@ CODESTARTsetModCnf
 			loadModConf->listContainersOptions = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
 		} else if(!strcmp(modpblk.descr[i].name, "getcontainerlogoptions")) {
 			loadModConf->getContainerLogOptions = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+			/* also intialize the non-tail version */
+			size_t offset = 0;
+			char buf[256];
+			size_t buf_size = sizeof(buf);
+			strncpy(buf, (char*)loadModConf->getContainerLogOptions, buf_size);
+			size_t option_str_len = strlen((char*)loadModConf->getContainerLogOptions);
+			uchar *option_str = calloc(1, option_str_len);
+			CHKmalloc(option_str);
+
+			const char *search_str = "tail=";
+			size_t search_str_len = strlen(search_str);
+			char *token = strtok(buf, "&");
+
+			while (token != NULL) {
+				int len = strlen(token);
+				if (offset + len + 1 >= 256) {
+					break;
+				}
+				if (strncmp(token, search_str, search_str_len) == 0) {
+					token = strtok(NULL, "&");
+					continue;
+				}
+				offset += snprintf((char*)option_str + offset, (option_str_len - offset), "%s&", token);
+				token = strtok(NULL, "&");
+			}
+			loadModConf->getContainerLogOptionsWithoutTail = option_str;
 		} else if(!strcmp(modpblk.descr[i].name, "dockerapiunixsockaddr")) {
 			loadModConf->dockerApiUnixSockAddr = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
 		} else if(!strcmp(modpblk.descr[i].name, "dockerapiaddr")) {
 			loadModConf->dockerApiAddr = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
 		} else if(!strcmp(modpblk.descr[i].name, "apiversionstr")) {
 			loadModConf->apiVersionStr = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+		} else if(!strcmp(modpblk.descr[i].name, "retrievenewlogsfromstart")) {
+			loadModConf->retrieveNewLogsFromStart = (sbool) pvals[i].val.d.n;
 		} else {
 			LogError(0, RS_RET_INVALID_PARAMS,
 					"imdocker: program error, non-handled "
@@ -850,6 +861,10 @@ CODESTARTactivateCnf
 	if (!loadModConf->getContainerLogOptions) {
 		loadModConf->getContainerLogOptions = (uchar*) strdup(DFLT_getContainerLogOptions);
 	}
+if (!loadModConf->getContainerLogOptionsWithoutTail) {
+		loadModConf->getContainerLogOptionsWithoutTail =
+			(uchar*) strdup(DFLT_getContainerLogOptionsWithoutTail);
+	}
 	runModConf = loadModConf;
 
 	/* support statistics gathering */
@@ -887,6 +902,9 @@ CODESTARTfreeCnf
 	}
 	if (loadModConf->getContainerLogOptions) {
 		free(loadModConf->getContainerLogOptions);
+	}
+	if (loadModConf->getContainerLogOptionsWithoutTail) {
+		free(loadModConf->getContainerLogOptionsWithoutTail);
 	}
 	if (loadModConf->listContainersOptions) {
 		free(loadModConf->listContainersOptions);
@@ -1324,7 +1342,7 @@ dupDockerContainerName(const char* pname) {
 }
 
 static rsRetVal
-process_json(const char* json, docker_cont_log_instances_t *pDockerContainerInstances) {
+process_json(sbool isInit, const char* json, docker_cont_log_instances_t *pDockerContainerInstances) {
 	DEFiRet;
 	struct fjson_object *json_obj = NULL;
 	int mut_locked = 0;
@@ -1401,7 +1419,7 @@ process_json(const char* json, docker_cont_log_instances_t *pDockerContainerInst
 				if (iRet == RS_RET_NOT_FOUND) {
 					if (dockerContLogsInstNew(&pInst, containerId, &containerInfo, SubmitMsg)
 							== RS_RET_OK) {
-						CHKiRet(dockerContLogsInstSetUrlById(pInst,
+						CHKiRet(dockerContLogsInstSetUrlById(isInit, pInst,
 									pDockerContainerInstances->curlm, containerId));
 						CHKiRet(dockerContLogReqsAdd(pDockerContainerInstances, pInst));
 					}
@@ -1421,7 +1439,7 @@ finalize_it:
 }
 
 static rsRetVal
-getContainerIds(docker_cont_log_instances_t *pDockerContainerInstances, const char* url) {
+getContainerIds(sbool isInit, docker_cont_log_instances_t *pDockerContainerInstances, const char* url) {
 	DEFiRet;
 	imdocker_req_t *req=NULL;
 
@@ -1433,7 +1451,7 @@ getContainerIds(docker_cont_log_instances_t *pDockerContainerInstances, const ch
 		ABORT_FINALIZE(RS_RET_ERR);
 	}
 
-	CHKiRet(process_json((const char*)req->buf->data, pDockerContainerInstances));
+	CHKiRet(process_json(isInit, (const char*)req->buf->data, pDockerContainerInstances));
 
 finalize_it:
 	if (req) {
@@ -1443,7 +1461,7 @@ finalize_it:
 }
 
 static rsRetVal
-getContainerIdsAndAppend(docker_cont_log_instances_t *pDockerContainerInstances) {
+getContainerIdsAndAppend(sbool isInit, docker_cont_log_instances_t *pDockerContainerInstances) {
 	DEFiRet;
 
 	char url[256];
@@ -1455,7 +1473,7 @@ getContainerIdsAndAppend(docker_cont_log_instances_t *pDockerContainerInstances)
 
 	snprintf(url, sizeof(url), "%s/%s/containers/json?%s",
 			pApiAddr, runModConf->apiVersionStr, runModConf->listContainersOptions);
-	CHKiRet(getContainerIds(pDockerContainerInstances, (const char*)url));
+	CHKiRet(getContainerIds(isInit, pDockerContainerInstances, (const char*)url));
 	if (Debug) { dockerContLogReqsPrint(pDockerContainerInstances); }
 
 finalize_it:
@@ -1531,7 +1549,7 @@ processAndPollContainerLogs(docker_cont_log_instances_t *pDockerContainerInstanc
 			cleanupCompletedContainerRequests(pDockerContainerInstances);
 		}
 
-	} while (still_running);
+	} while (still_running && glbl.GetGlobalInputTermState() == 0);
 
 	cleanupCompletedContainerRequests(pDockerContainerInstances);
 
@@ -1544,7 +1562,7 @@ getContainersTask(void *pdata) {
 
 	while(glbl.GetGlobalInputTermState() == 0) {
 		srSleep(runModConf->iPollInterval, 10);
-		getContainerIdsAndAppend(pInstances);
+		getContainerIdsAndAppend(false, pInstances);
 	}
 	return pdata;
 }
@@ -1566,7 +1584,7 @@ CODESTARTrunInput
 	}
 
 	/* get all current containers now */
-	CHKiRet(getContainerIdsAndAppend(pDockerContainerInstances));
+	CHKiRet(getContainerIdsAndAppend(true, pDockerContainerInstances));
 
 	/* using default stacksize */
 	CHKiConcCtrl(pthread_attr_init(&thrd_attr));

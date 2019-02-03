@@ -764,9 +764,20 @@ endif
 if ENABLE_IMDOCKER
 if ENABLE_IMDOCKER_TESTS
 TESTS += \
-	imdocker-unittests.sh
-endif
-endif
+	imdocker-unittests.sh \
+	imdocker-basic.sh \
+	imdocker-long-logline.sh \
+	imdocker-new-logs-from-start.sh
+
+if HAVE_VALGRIND
+TESTS += \
+	imdocker-basic-vg.sh \
+	imdocker-long-logline-vg.sh \
+	imdocker-new-logs-from-start-vg.sh
+endif # HAVE_VALGRIND
+
+endif # ENABLE_IMDOCKER_TESTS
+endif # ENABLE_IMDOCKER
 
 if ENABLE_IMPSTATS
 TESTS +=  \
@@ -2064,6 +2075,12 @@ EXTRA_DIST= \
 	mmkubernetes-basic.out.json \
 	es-writeoperation.sh \
 	imdocker-unittests.sh \
+	imdocker-basic.sh \
+	imdocker-basic-vg.sh \
+	imdocker-long-logline.sh \
+	imdocker-long-logline-vg.sh \
+	imdocker-new-logs-from-start.sh \
+	imdocker-new-logs-from-start-vg.sh \
 	testsuites/incltest.d/include.conf \
 	testsuites/abort-uncleancfg-goodcfg.conf \
 	testsuites/include-std-omfile-action.conf \
