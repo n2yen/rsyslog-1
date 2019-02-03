@@ -328,7 +328,7 @@ dockerContLogsBufWrite(docker_cont_logs_buf_t *pThis, const uchar *pdata, size_t
 	DEFiRet;
 
 	imdocker_buf_t *mem = pThis->buf;
-	if (mem->len + write_size > mem->data_size) {
+	if (mem->len + write_size + 1 > mem->data_size) {
 		uchar *pbuf=NULL;
 		if ((pbuf = realloc(mem->data, mem->len + write_size + 1)) == NULL) {
 			LogError(errno, RS_RET_ERR, "%s() - realloc failed!\n", __FUNCTION__);
