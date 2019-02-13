@@ -72,6 +72,9 @@ extern int Debug;
 #define DOCKER_CONTAINER_IMAGEID_PARSE_NAME "ImageID"
 #define DOCKER_CONTAINER_LABELS_PARSE_NAME  "Labels"
 
+/* label defines */
+#define DOCKER_CONTAINER_LABEL_KEY_STARTREGEX "imdocker.startregex"
+
 /* DEFAULT VALUES */
 #define DFLT_pollingInterval   60      /* polling interval in seconds */
 #define DFLT_retrieveNewLogsFromStart 1/* Process newly found containers logs from start */
@@ -128,10 +131,13 @@ typedef struct docker_container_info_s {
 } docker_container_info_t;
 
 typedef struct docker_cont_logs_inst_s {
-	char* id;
+	char *id;
 	char short_id[12];
 	docker_container_info_t *container_info;
 	docker_cont_logs_req_t  *logsReq;
+	uchar *start_regex;
+	regex_t start_preg;  /* compiled version of start_regex */
+	uint32_t prevSegEnd;
 } docker_cont_logs_inst_t;
 
 typedef struct docker_cont_log_instances_s {
@@ -188,6 +194,10 @@ static CURLcode docker_get(imdocker_req_t *req, const char* url);
 static char* dupDockerContainerName(const char* pname);
 static rsRetVal SubmitMsg(docker_cont_logs_inst_t *pInst, docker_cont_logs_buf_t *pBufData,
 		const uchar* pszTag);
+/* experimental stuff */
+static rsRetVal
+SubmitMsg2(docker_cont_logs_inst_t *pInst, docker_cont_logs_buf_t *pBufData, const uchar* pszTag);
+/* end experimental stuff */
 static size_t imdocker_container_list_curlCB(void *data, size_t size, size_t nmemb, void *buffer);
 static size_t imdocker_container_logs_curlCB(void *data, size_t size, size_t nmemb, void *buffer);
 static sbool get_stream_info(const uchar* data, size_t size, int8_t *stream_type, size_t *payload_size);
@@ -443,8 +453,54 @@ dockerContLogsInstDestruct(docker_cont_logs_inst_t *pThis) {
 		if (pThis->logsReq) {
 			dockerContLogsReqDestruct(pThis->logsReq);
 		}
+		if (pThis->start_regex) {
+			free(pThis->start_regex);
+			regfree(&pThis->start_preg);
+		}
 		free(pThis);
 	}
+}
+
+static rsRetVal
+parseLabels(docker_cont_logs_inst_t *inst, const uchar* json) {
+	DEFiRet;
+
+	/* parse out if we need to do special handling for mult-line */
+	dbgprintf("%s() - parsing json=%s\n", __FUNCTION__, json);
+
+	struct fjson_object *json_obj = NULL;
+
+	json_obj = fjson_tokener_parse((const char*)json);
+	struct fjson_object_iterator it = fjson_object_iter_begin(json_obj);
+	struct fjson_object_iterator itEnd = fjson_object_iter_end(json_obj);
+	while (!fjson_object_iter_equal(&it, &itEnd)) {
+		if (Debug) {
+			DBGPRINTF("%s - \t%s: '%s'\n",
+					__FUNCTION__,
+					fjson_object_iter_peek_name(&it),
+					fjson_object_get_string(fjson_object_iter_peek_value(&it)));
+		}
+
+		if (strcmp(fjson_object_iter_peek_name(&it), DOCKER_CONTAINER_LABEL_KEY_STARTREGEX) == 0) {
+			inst->start_regex = (uchar*)strdup(fjson_object_get_string(fjson_object_iter_peek_value(&it)));
+			// compile the regex for future use.
+			int err = regcomp(&inst->start_preg, fjson_object_get_string(fjson_object_iter_peek_value(&it)),
+					REG_EXTENDED);
+			if (err != 0) {
+				char errbuf[512];
+				regerror(err, &inst->start_preg, errbuf, sizeof(errbuf));
+				LogError(0, err, "%s() - error in startregex compile: %s", __FUNCTION__, errbuf);
+				ABORT_FINALIZE(RS_RET_ERR);
+			}
+		}
+		fjson_object_iter_next(&it);
+	}
+
+finalize_it:
+	if (json_obj) {
+		json_object_put(json_obj);
+	}
+	RETiRet;
 }
 
 static rsRetVal
@@ -475,6 +531,13 @@ dockerContLogsInstNew(docker_cont_logs_inst_t **ppThis, const char* id,
 				(uchar*)strdup((char*)container_info->json_str_labels);
 		}
 	}
+	pThis->start_regex = NULL;
+	pThis->prevSegEnd = 0;
+	/* initialize based on labels found */
+	if (pThis->container_info && pThis->container_info->json_str_labels) {
+		parseLabels(pThis, pThis->container_info->json_str_labels);
+	}
+
 	*ppThis = pThis;
 
 finalize_it:
@@ -938,11 +1001,10 @@ addDockerMetaData(const uchar* container_id, docker_container_info_t* pinfo, sms
 }
 
 static rsRetVal
-enqMsg(docker_cont_logs_inst_t *pInst, uchar *msg, const uchar *pszTag, struct timeval *tp)
+enqMsg(docker_cont_logs_inst_t *pInst, uchar *msg, size_t len, const uchar *pszTag, struct timeval *tp)
 {
 	struct syslogTime st;
 	smsg_t *pMsg;
-	size_t len;
 	DEFiRet;
 
 	if (!msg) {
@@ -957,13 +1019,12 @@ enqMsg(docker_cont_logs_inst_t *pInst, uchar *msg, const uchar *pszTag, struct t
 	}
 	MsgSetFlowControlType(pMsg, eFLOWCTL_LIGHT_DELAY);
 	MsgSetInputName(pMsg, pInputName);
-	len = strlen((char*)msg);
 	MsgSetRawMsg(pMsg, (char*)msg, len);
 	if(len > 0)
 		parser.SanitizeMsg(pMsg);
 	MsgSetMSGoffs(pMsg, 0);  /* we do not have a header... */
 	MsgSetRcvFrom(pMsg, glbl.GetLocalHostNameProp());
-	MsgSetRcvFromIP(pMsg, pLocalHostIP);
+	if (pLocalHostIP) { MsgSetRcvFromIP(pMsg, pLocalHostIP); }
 	MsgSetHOSTNAME(pMsg, glbl.GetLocalHostName(), ustrlen(glbl.GetLocalHostName()));
 	MsgSetTAG(pMsg, pszTag, ustrlen(pszTag));
 
@@ -1050,13 +1111,84 @@ finalize_it:
 }
 
 static rsRetVal
+SubmitMultiLineMsg(docker_cont_logs_inst_t *pInst, docker_cont_logs_buf_t *pBufData,
+		const uchar* pszTag, size_t len) {
+	DEFiRet;
+
+	imdocker_buf_t *mem = (imdocker_buf_t*)pBufData->buf;
+	DBGPRINTF("%s() - enqMsg: {type=%d, len=%lu} %s\n",
+			__FUNCTION__, pBufData->stream_type, mem->len, mem->data);
+
+	uchar* message = (uchar*)mem->data;
+	enqMsg(pInst, message, len, (const uchar*)pszTag, NULL);
+
+	size_t size = mem->len - pInst->prevSegEnd;
+	memmove(mem->data, mem->data+pInst->prevSegEnd, size);
+	mem->data[len] = '\0';
+	mem->len = size;
+	pBufData->bytes_remaining = 0;
+
+	RETiRet;
+}
+
+static rsRetVal
+SubmitMsgWithStartRegex(docker_cont_logs_inst_t *pInst, docker_cont_logs_buf_t *pBufData, const uchar* pszTag) {
+	imdocker_buf_t *mem = (imdocker_buf_t*)pBufData->buf;
+	/* must be null terminated string */
+	assert(mem->data[mem->len] == 0 || mem->data[mem->len] == '\0');
+
+	DBGPRINTF("%s() - enqMsg: {type=%d, len=%lu} %s\n",
+			__FUNCTION__, pBufData->stream_type, mem->len, mem->data);
+
+	const char* thisLine = (const char*) mem->data;
+	if (pInst->prevSegEnd) {
+		thisLine = (const char*) mem->data+pInst->prevSegEnd;
+	}
+	DBGPRINTF("prevSeg: %d, thisLine: '%s'\n", pInst->prevSegEnd, thisLine);
+	DBGPRINTF("line(s) so far: '%s'\n", mem->data);
+
+	/* check if this line is a start of multi-line message */
+	regex_t *start_preg = (pInst->start_regex == NULL) ? NULL : &pInst->start_preg;
+	const int isStartMatch = start_preg ?
+		!regexec(start_preg, (char*)thisLine, 0, NULL, 0) : 0;
+
+	if (isStartMatch && pInst->prevSegEnd != 0) {
+		SubmitMultiLineMsg(pInst, pBufData, pszTag, pInst->prevSegEnd);
+		pInst->prevSegEnd = 0;
+		FINALIZE;
+	} else {
+		/* just continue parsing using same buffer */
+		pInst->prevSegEnd = mem->len;
+	}
+
+finalize_it:
+	return RS_RET_OK;
+}
+
+static rsRetVal
+SubmitMsg2(docker_cont_logs_inst_t *pInst, docker_cont_logs_buf_t *pBufData, const uchar* pszTag) {
+	imdocker_buf_t *mem = (imdocker_buf_t*)pBufData->buf;
+	DBGPRINTF("%s() - enqMsg: {type=%d, len=%lu} %s\n",
+			__FUNCTION__, pBufData->stream_type, mem->len, mem->data);
+
+	if (pInst->start_regex) {
+		SubmitMsgWithStartRegex(pInst, pBufData, pszTag);
+	} else {
+		SubmitMsg(pInst, pBufData, pszTag);
+	}
+	return RS_RET_OK;
+}
+
+/* end experimental stuff */
+
+static rsRetVal
 SubmitMsg(docker_cont_logs_inst_t *pInst, docker_cont_logs_buf_t *pBufData, const uchar* pszTag) {
 	imdocker_buf_t *mem = (imdocker_buf_t*)pBufData->buf;
 	DBGPRINTF("%s() - enqMsg: {type=%d, len=%lu} %s\n",
 			__FUNCTION__, pBufData->stream_type, mem->len, mem->data);
 
 	uchar* message = mem->data;
-	enqMsg(pInst, message, (const uchar*)pszTag, NULL);
+	enqMsg(pInst, message, mem->len, (const uchar*)pszTag, NULL);
 
 	/* clear existing buffer. */
 	mem->len = 0;
@@ -1417,7 +1549,11 @@ process_json(sbool isInit, const char* json, docker_cont_log_instances_t *pDocke
 				docker_cont_logs_inst_t *pInst = NULL;
 				iRet = dockerContLogReqsGet(pDockerContainerInstances, &pInst, containerId);
 				if (iRet == RS_RET_NOT_FOUND) {
+#if 0
 					if (dockerContLogsInstNew(&pInst, containerId, &containerInfo, SubmitMsg)
+#else
+					if (dockerContLogsInstNew(&pInst, containerId, &containerInfo, SubmitMsg2)
+#endif
 							== RS_RET_OK) {
 						CHKiRet(dockerContLogsInstSetUrlById(isInit, pInst,
 									pDockerContainerInstances->curlm, containerId));
