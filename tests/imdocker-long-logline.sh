@@ -31,7 +31,7 @@ docker run \
 shutdown_when_empty
 
 # check the log line length
-echo "file name: $COOKIE"
+echo "file name: $RSYSLOG_OUT_LOG"
 count=$(grep "aaaaaaa" $RSYSLOG_OUT_LOG | tr -d "\n" | wc -c)
 
 if [ "x$count" == "x$SIZE" ]; then
