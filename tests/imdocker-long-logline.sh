@@ -3,15 +3,16 @@
 
 # imdocker unit tests are enabled with --enable-imdocker-tests
 . ${srcdir:=.}/diag.sh init
+export COOKIE=$(tr -dc 'a-zA-Z0-9' < /dev/urandom | fold -w 10 | head -n 1)
 
 generate_conf
 add_conf '
-template(name="outfmt" type="string" string="%$!metadata!Names% %msg%\n")
+template(name="outfmt" type="string" string="%msg%\n")
 
 module(load="../contrib/imdocker/.libs/imdocker" PollingInterval="1"
         GetContainerLogOptions="timestamps=0&follow=1&stdout=1&stderr=0")
 
-if $inputname == "imdocker" then {
+if $!metadata!Names == "'$COOKIE'" then {
   action(type="omfile" template="outfmt"  file="'$RSYSLOG_OUT_LOG'")
 }
 
@@ -22,16 +23,16 @@ startup
 SIZE=17000
 # launch container with a long log line
 docker run \
-  --name $RSYSLOG_DYNNAME \
+  --name $COOKIE \
   -e size=$SIZE \
   --rm \
-  alpine /bin/sh -c 'sleep 5; echo "$(yes a | head -n $size | tr -d "\n")"; sleep 1; echo "end test";' > /dev/null
+  alpine /bin/sh -c 'sleep 5; echo "$(yes a | head -n $size | tr -d "\n")"; sleep 1;' > /dev/null
 
 shutdown_when_empty
 
 # check the log line length
-echo "file name: $RSYSLOG_OUT_LOG"
-count=$(grep "$RSYSLOG_DYNNAME aaaaaaa" $RSYSLOG_OUT_LOG |tr -d "$RSYSLOG_DYNNAME " | tr -d "\n" | wc -c)
+echo "file name: $COOKIE"
+count=$(grep "aaaaaaa" $RSYSLOG_OUT_LOG | tr -d "\n" | wc -c)
 
 if [ "x$count" == "x$SIZE" ]; then
   echo "correct log line length: $count"
