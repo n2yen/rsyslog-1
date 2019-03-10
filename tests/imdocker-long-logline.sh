@@ -4,12 +4,12 @@
 # imdocker unit tests are enabled with --enable-imdocker-tests
 . ${srcdir:=.}/diag.sh init
 export COOKIE=$(tr -dc 'a-zA-Z0-9' < /dev/urandom | fold -w 10 | head -n 1)
+SIZE=17000
 
 generate_conf
 add_conf '
 template(name="outfmt" type="string" string="%msg%\n")
-
-module(load="../contrib/imdocker/.libs/imdocker" PollingInterval="1"
+module(load="../contrib/imdocker/.libs/imdocker"
         GetContainerLogOptions="timestamps=0&follow=1&stdout=1&stderr=0")
 
 if $!metadata!Names == "'$COOKIE'" then {
@@ -18,17 +18,18 @@ if $!metadata!Names == "'$COOKIE'" then {
 
 $MaxMessageSize 64k
 '
-startup
 
-SIZE=17000
 # launch container with a long log line
 docker run \
   --name $COOKIE \
   -e size=$SIZE \
-  --rm \
-  alpine /bin/sh -c 'sleep 5; echo "$(yes a | head -n $size | tr -d "\n")"; sleep 1;' > /dev/null
+  alpine /bin/sh -c 'echo "$(yes a | head -n $size | tr -d "\n")";' > /dev/null
+
+#export RS_REDIR=-d
+startup
 
 shutdown_when_empty
+wait_shutdown
 
 # check the log line length
 echo "file name: $RSYSLOG_OUT_LOG"
@@ -41,4 +42,5 @@ else
   error_exit 1
 fi
 
+docker container rm $COOKIE
 exit_test

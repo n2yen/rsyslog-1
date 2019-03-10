@@ -72,6 +72,7 @@ extern int Debug;
 #define DOCKER_CONTAINER_ID_PARSE_NAME      "Id"
 #define DOCKER_CONTAINER_NAMES_PARSE_NAME   "Names"
 #define DOCKER_CONTAINER_IMAGEID_PARSE_NAME "ImageID"
+#define DOCKER_CONTAINER_CREATED_PARSE_NAME "Created"
 #define DOCKER_CONTAINER_LABELS_PARSE_NAME  "Labels"
 
 /* label defines */
@@ -82,6 +83,7 @@ extern int Debug;
 #define DFLT_retrieveNewLogsFromStart 1/* Process newly found containers logs from start */
 #define DFLT_containersLimit   25      /* maximum number of containers */
 #define DFLT_trimLineOverBytes 4194304 /* limit log lines to the value - 4MB default */
+#define DFLT_initListContainersSecsBack 60 /* secs back from initial start of initial containers list */
 
 #ifdef ENABLE_IMDOCKER_UNIT_TESTS
 #include "imdocker_unit_tests.h"
@@ -128,6 +130,7 @@ typedef struct imdocker_req_s {
 typedef struct docker_container_info_s {
 	uchar *name;
 	uchar *image_id;
+	uint64_t created;
 	/* json string container labels */
 	uchar *json_str_labels;
 } docker_container_info_t;
@@ -146,6 +149,10 @@ typedef struct docker_cont_log_instances_s {
 	struct hashtable* ht_container_log_insts;
 	pthread_mutex_t mut;
 	CURLM         *curlm;
+	/* track the latest created container */
+	uint64_t last_container_created;
+	uchar   *last_container_id;
+	time_t  time_started;
 } docker_cont_log_instances_t;
 
 /* FORWARD DEFINITIONS */
@@ -225,7 +232,7 @@ STATSCOUNTER_DEF(ctrCurlError, mutctrCurlError)
 const char* DFLT_dockerAPIUnixSockAddr  = "/var/run/docker.sock";
 const char* DFLT_dockerAPIAdd           = "http://localhost:2375";
 const char* DFLT_apiVersionStr          = "v1.27";
-const char* DFLT_listContainersOptions  = "";
+const char* DFLT_listContainersOptions  = "all=true";
 const char* DFLT_getContainerLogOptions = "timestamps=0&follow=1&stdout=1&stderr=1&tail=1";
 const char* DFLT_getContainerLogOptionsWithoutTail = "timestamps=0&follow=1&stdout=1&stderr=1";
 
@@ -237,6 +244,7 @@ struct modConfData_s {
 	uchar    *getContainerLogOptions;
 	uchar    *getContainerLogOptionsWithoutTail;
 	int      iPollInterval;  /* in seconds */
+	uint32_t initListContainersSecsBack;
 	uchar    *dockerApiUnixSockAddr;
 	uchar    *dockerApiAddr;
 	sbool    retrieveNewLogsFromStart;
@@ -259,6 +267,7 @@ static struct cnfparamdescr modpdescr[] = {
 	{ "dockerapiaddr", eCmdHdlrString, 0 },
 	{ "listcontainersoptions", eCmdHdlrString, 0 },
 	{ "getcontainerlogoptions", eCmdHdlrString, 0 },
+	{ "initlistcontainerssecsback", eCmdHdlrPositiveInt, 0 },
 	{ "pollinginterval", eCmdHdlrPositiveInt, 0 },
 	{ "retrievenewlogsfromstart", eCmdHdlrBinary, 0 },
 	{ "trimlineoverbytes", eCmdHdlrPositiveInt, 0 },
@@ -465,7 +474,7 @@ parseLabels(docker_cont_logs_inst_t *inst, const uchar* json) {
 	DEFiRet;
 
 	/* parse out if we need to do special handling for mult-line */
-	dbgprintf("%s() - parsing json=%s\n", __FUNCTION__, json);
+	DBGPRINTF("%s() - parsing json=%s\n", __FUNCTION__, json);
 
 	struct fjson_object *json_obj = fjson_tokener_parse((const char*)json);
 	struct fjson_object_iterator it = fjson_object_iter_begin(json_obj);
@@ -526,6 +535,7 @@ dockerContLogsInstNew(docker_cont_logs_inst_t **ppThis, const char* id,
 			pThis->container_info->json_str_labels =
 				(uchar*)strdup((char*)container_info->json_str_labels);
 		}
+		pThis->container_info->created = container_info->created;
 	}
 	pThis->start_regex = NULL;
 	pThis->prevSegEnd = 0;
@@ -673,6 +683,9 @@ dockerContLogReqsDestruct(docker_cont_log_instances_t *pThis) {
 			hashtable_destroy(pThis->ht_container_log_insts, 1);
 			pthread_mutex_unlock(&pThis->mut);
 		}
+		if (pThis->last_container_id) {
+			free(pThis->last_container_id);
+		}
 		curl_multi_cleanup(pThis->curlm);
 		pthread_mutex_destroy(&pThis->mut);
 		free(pThis);
@@ -713,14 +726,14 @@ dockerContLogReqsPrint(docker_cont_log_instances_t *pThis) {
 		int ret = 0;
 		struct hashtable_itr *itr = hashtable_iterator(pThis->ht_container_log_insts);
 
-		dbgprintf("%s() - All container instances, count=%d...\n", __FUNCTION__, count);
+		DBGPRINTF("%s() - All container instances, count=%d...\n", __FUNCTION__, count);
 		do {
 			docker_cont_logs_inst_t *pObj = hashtable_iterator_value(itr);
 			dockerContLogsInstPrint(pObj);
 			ret = hashtable_iterator_advance(itr);
 		} while (ret);
 		free (itr);
-		dbgprintf("End of container instances.\n");
+		DBGPRINTF("End of container instances.\n");
 	}
 
 	RETiRet;
@@ -802,6 +815,7 @@ CODESTARTbeginCnfLoad
 
 	/* init our settings */
 	loadModConf->iPollInterval     = DFLT_pollingInterval; /* in seconds */
+	loadModConf->initListContainersSecsBack= DFLT_initListContainersSecsBack;
 	loadModConf->retrieveNewLogsFromStart  = DFLT_retrieveNewLogsFromStart;
 	loadModConf->containersLimit   = DFLT_containersLimit;
 	loadModConf->trimLineOverBytes = DFLT_trimLineOverBytes;
@@ -844,6 +858,8 @@ CODESTARTsetModCnf
 			loadModConf->trimLineOverBytes = (int) pvals[i].val.d.n;
 		} else if(!strcmp(modpblk.descr[i].name, "listcontainersoptions")) {
 			loadModConf->listContainersOptions = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+		} else if(!strcmp(modpblk.descr[i].name, "initlistcontainerssecsback")) {
+			loadModConf->initListContainersSecsBack = (int) pvals[i].val.d.n;
 		} else if(!strcmp(modpblk.descr[i].name, "getcontainerlogoptions")) {
 			loadModConf->getContainerLogOptions = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
 			/* also intialize the non-tail version */
@@ -1032,7 +1048,8 @@ enqMsg(docker_cont_logs_inst_t *pInst, uchar *msg, size_t offset, const uchar *p
 	/* docker container metadata */
 	addDockerMetaData((const uchar*)pInst->short_id, pInst->container_info, pMsg);
 
-	DBGPRINTF("imdocker: enqMsg - %s\n", msg);
+	const char *name = (const char*)pInst->container_info->name;
+	DBGPRINTF("imdocker: %s - %s:%s\n", __FUNCTION__, name, msg);
 	CHKiRet(ratelimitAddMsg(ratelimiter, NULL, pMsg));
 	STATSCOUNTER_INC(ctrSubmit, mutCtrSubmit);
 
@@ -1117,7 +1134,7 @@ SubmitMultiLineMsg(docker_cont_logs_inst_t *pInst, docker_cont_logs_buf_t *pBufD
 	DEFiRet;
 
 	imdocker_buf_t *mem = (imdocker_buf_t*)pBufData->buf;
-	DBGPRINTF("%s() - enqMsg: {type=%d, len=%u} %s\n",
+	DBGPRINTF("%s() {type=%d, len=%u} %s\n",
 			__FUNCTION__, pBufData->stream_type, (unsigned int)mem->len, mem->data);
 
 	uchar* message = (uchar*)mem->data;
@@ -1166,7 +1183,7 @@ finalize_it:
 static rsRetVal
 SubmitMsg2(docker_cont_logs_inst_t *pInst, docker_cont_logs_buf_t *pBufData, const uchar* pszTag) {
 	imdocker_buf_t *mem = (imdocker_buf_t*)pBufData->buf;
-	DBGPRINTF("%s() - enqMsg: {type=%d, len=%u} %s\n",
+	DBGPRINTF("%s() - {type=%d, len=%u} %s\n",
 			__FUNCTION__, pBufData->stream_type, (unsigned int)mem->len, mem->data);
 
 	if (pInst->start_regex) {
@@ -1180,7 +1197,7 @@ SubmitMsg2(docker_cont_logs_inst_t *pInst, docker_cont_logs_buf_t *pBufData, con
 static rsRetVal
 SubmitMsg(docker_cont_logs_inst_t *pInst, docker_cont_logs_buf_t *pBufData, const uchar* pszTag) {
 	imdocker_buf_t *mem = (imdocker_buf_t*)pBufData->buf;
-	DBGPRINTF("%s() - enqMsg: {type=%d, len=%u} %s\n",
+	DBGPRINTF("%s() - {type=%d, len=%u} %s\n",
 			__FUNCTION__, pBufData->stream_type, (unsigned int)mem->len, mem->data);
 
 	uchar* message = mem->data;
@@ -1462,24 +1479,24 @@ dupDockerContainerName(const char* pname) {
 }
 
 static rsRetVal
-process_json(sbool isInit, const char* json, docker_cont_log_instances_t *pDockerContainerInstances) {
+process_json(sbool isInit, const char* json, docker_cont_log_instances_t *pInstances) {
 	DEFiRet;
 	struct fjson_object *json_obj = NULL;
 	int mut_locked = 0;
 	DBGPRINTF("%s() - parsing json=%s\n", __FUNCTION__, json);
 
-	if (!pDockerContainerInstances) {
+	if (!pInstances) {
 		ABORT_FINALIZE(RS_RET_OK);
 	}
 
 	json_obj = fjson_tokener_parse(json);
-	if (!json_obj) {
+	if (!json_obj || !fjson_object_is_type(json_obj, fjson_type_array)) {
 		ABORT_FINALIZE(RS_RET_OK);
 	}
 
 	int length = fjson_object_array_length(json_obj);
 	/* LOCK the update process. */
-	CHKiConcCtrl(pthread_mutex_lock(&pDockerContainerInstances->mut));
+	CHKiConcCtrl(pthread_mutex_lock(&pInstances->mut));
 	mut_locked = 1;
 
 	for (int i = 0; i < length; i++) {
@@ -1491,6 +1508,7 @@ process_json(sbool isInit, const char* json, docker_cont_log_instances_t *pDocke
 			docker_container_info_t containerInfo = {
 				.name=NULL,
 				.image_id=NULL,
+				.created=0,
 				.json_str_labels=NULL
 			};
 
@@ -1514,7 +1532,6 @@ process_json(sbool isInit, const char* json, docker_cont_log_instances_t *pDocke
 						fjson_object* names_elm =
 							json_object_array_get_idx(fjson_object_iter_peek_value(&it), 0);
 						containerInfo.name = (uchar*)fjson_object_get_string(names_elm);
-						DBGPRINTF("Name: '%s'\n", containerInfo.name);
 					}
 				} else if (strcmp(fjson_object_iter_peek_name(&it),
 							DOCKER_CONTAINER_IMAGEID_PARSE_NAME) == 0) {
@@ -1522,6 +1539,20 @@ process_json(sbool isInit, const char* json, docker_cont_log_instances_t *pDocke
 						(uchar*)fjson_object_get_string(
 									fjson_object_iter_peek_value(&it)
 									);
+				} else if (strcmp(fjson_object_iter_peek_name(&it),
+							DOCKER_CONTAINER_CREATED_PARSE_NAME) == 0) {
+					containerInfo.created =
+						fjson_object_get_int64(
+									fjson_object_iter_peek_value(&it)
+									);
+					uint64_t from_time = (uint64_t)pInstances->time_started -
+						loadModConf->initListContainersSecsBack;
+
+					/* stop parsing and continue */
+					if (containerInfo.created < from_time) {
+						containerId = NULL;
+						break;
+					}
 				} else if (strcmp(fjson_object_iter_peek_name(&it),
 							DOCKER_CONTAINER_LABELS_PARSE_NAME) == 0) {
 					containerInfo.json_str_labels =
@@ -1535,7 +1566,7 @@ process_json(sbool isInit, const char* json, docker_cont_log_instances_t *pDocke
 
 			if (containerId) {
 				docker_cont_logs_inst_t *pInst = NULL;
-				iRet = dockerContLogReqsGet(pDockerContainerInstances, &pInst, containerId);
+				iRet = dockerContLogReqsGet(pInstances, &pInst, containerId);
 				if (iRet == RS_RET_NOT_FOUND) {
 #ifdef USE_MULTI_LINE
 					if (dockerContLogsInstNew(&pInst, containerId, &containerInfo, SubmitMsg2)
@@ -1543,9 +1574,19 @@ process_json(sbool isInit, const char* json, docker_cont_log_instances_t *pDocke
 					if (dockerContLogsInstNew(&pInst, containerId, &containerInfo, SubmitMsg)
 #endif
 							== RS_RET_OK) {
+						if (pInstances->last_container_created < containerInfo.created) {
+							pInstances->last_container_created = containerInfo.created;
+							if (pInstances->last_container_id) {
+								free(pInstances->last_container_id);
+							}
+							pInstances->last_container_id = (uchar*)strdup(containerId);
+							DBGPRINTF("last_container_id updated: ('%s', %u)\n",
+									pInstances->last_container_id,
+									(unsigned)pInstances->last_container_created);
+						}
 						CHKiRet(dockerContLogsInstSetUrlById(isInit, pInst,
-									pDockerContainerInstances->curlm, containerId));
-						CHKiRet(dockerContLogReqsAdd(pDockerContainerInstances, pInst));
+									pInstances->curlm, containerId));
+						CHKiRet(dockerContLogReqsAdd(pInstances, pInst));
 					}
 				}
 			}
@@ -1554,7 +1595,7 @@ process_json(sbool isInit, const char* json, docker_cont_log_instances_t *pDocke
 
 finalize_it:
 	if (mut_locked) {
-		pthread_mutex_unlock(&pDockerContainerInstances->mut);
+		pthread_mutex_unlock(&pInstances->mut);
 	}
 	if (json_obj) {
 		json_object_put(json_obj);
@@ -1563,7 +1604,7 @@ finalize_it:
 }
 
 static rsRetVal
-getContainerIds(sbool isInit, docker_cont_log_instances_t *pDockerContainerInstances, const char* url) {
+getContainerIds(sbool isInit, docker_cont_log_instances_t *pInstances, const char* url) {
 	DEFiRet;
 	imdocker_req_t *req=NULL;
 
@@ -1575,7 +1616,7 @@ getContainerIds(sbool isInit, docker_cont_log_instances_t *pDockerContainerInsta
 		ABORT_FINALIZE(RS_RET_ERR);
 	}
 
-	CHKiRet(process_json(isInit, (const char*)req->buf->data, pDockerContainerInstances));
+	CHKiRet(process_json(isInit, (const char*)req->buf->data, pInstances));
 
 finalize_it:
 	if (req) {
@@ -1585,7 +1626,7 @@ finalize_it:
 }
 
 static rsRetVal
-getContainerIdsAndAppend(sbool isInit, docker_cont_log_instances_t *pDockerContainerInstances) {
+getContainerIdsAndAppend(sbool isInit, docker_cont_log_instances_t *pInstances) {
 	DEFiRet;
 
 	char url[256];
@@ -1595,23 +1636,35 @@ getContainerIdsAndAppend(sbool isInit, docker_cont_log_instances_t *pDockerConta
 		pApiAddr = runModConf->dockerApiAddr;
 	}
 
-	snprintf(url, sizeof(url), "%s/%s/containers/json?%s",
+	/*
+	 * TODO: consider if we really need 'isInit' parameter. I suspect we don't need it
+	 * and i'm almost certain Travis CI will complain its not used.
+	 */
+	if (pInstances->last_container_id) {
+		snprintf(url, sizeof(url), "%s/%s/containers/json?%s&filters={\"since\":[\"%s\"]}",
+				pApiAddr, runModConf->apiVersionStr, runModConf->listContainersOptions,
+				pInstances->last_container_id);
+	} else {
+		snprintf(url, sizeof(url), "%s/%s/containers/json?%s",
 			pApiAddr, runModConf->apiVersionStr, runModConf->listContainersOptions);
-	CHKiRet(getContainerIds(isInit, pDockerContainerInstances, (const char*)url));
-	if (Debug) { dockerContLogReqsPrint(pDockerContainerInstances); }
+	}
+	DBGPRINTF("listcontainers url: %s\n", url);
+
+	CHKiRet(getContainerIds(isInit, pInstances, (const char*)url));
+	if (Debug) { dockerContLogReqsPrint(pInstances); }
 
 finalize_it:
 	RETiRet;
 }
 
 static void
-cleanupCompletedContainerRequests(docker_cont_log_instances_t *pDockerContainerInstances) {
+cleanupCompletedContainerRequests(docker_cont_log_instances_t *pInstances) {
 	// clean up
 	int rc=0, msgs_left=0;
 	CURLMsg *msg=NULL;
 	CURL *pCurl;
 
-	while ((msg = curl_multi_info_read(pDockerContainerInstances->curlm, &msgs_left))) {
+	while ((msg = curl_multi_info_read(pInstances->curlm, &msgs_left))) {
 		if (msg->msg == CURLMSG_DONE) {
 			pCurl = msg->easy_handle;
 			rc = msg->data.result;
@@ -1626,15 +1679,15 @@ cleanupCompletedContainerRequests(docker_cont_log_instances_t *pDockerContainerI
 			if (Debug) {
 				long http_status=0;
 				curl_easy_getinfo(pCurl, CURLINFO_RESPONSE_CODE, &http_status);
-				dbgprintf("http status: %lu\n", http_status);
+				DBGPRINTF("http status: %lu\n", http_status);
 			}
-			curl_multi_remove_handle(pDockerContainerInstances->curlm, pCurl);
+			curl_multi_remove_handle(pInstances->curlm, pCurl);
 
 			const char* szContainerId = NULL;
 			if ((ccode = curl_easy_getinfo(pCurl, CURLINFO_PRIVATE, &szContainerId)) == CURLE_OK) {
-				dbgprintf("container disconnected: %s\n", szContainerId);
-				dockerContLogReqsRemove(pDockerContainerInstances, szContainerId);
-				dbgprintf("container removed...\n");
+				DBGPRINTF("container disconnected: %s\n", szContainerId);
+				dockerContLogReqsRemove(pInstances, szContainerId);
+				DBGPRINTF("container removed...\n");
 			} else {
 				LogError(0, RS_RET_ERR, "imdocker: private data not found "
 						"curl_easy_setopt(CURLINFO_PRIVATE) error - %d:%s\n",
@@ -1646,20 +1699,20 @@ cleanupCompletedContainerRequests(docker_cont_log_instances_t *pDockerContainerI
 }
 
 static rsRetVal
-processAndPollContainerLogs(docker_cont_log_instances_t *pDockerContainerInstances) {
+processAndPollContainerLogs(docker_cont_log_instances_t *pInstances) {
 	DEFiRet;
 	int count=0;
 
-	count = hashtable_count(pDockerContainerInstances->ht_container_log_insts);
-	dbgprintf("%s() - container instances: %d\n", __FUNCTION__, count);
+	count = hashtable_count(pInstances->ht_container_log_insts);
+	DBGPRINTF("%s() - container instances: %d\n", __FUNCTION__, count);
 
 	int still_running=0;
 
-	curl_multi_perform(pDockerContainerInstances->curlm, &still_running);
+	curl_multi_perform(pInstances->curlm, &still_running);
 	do {
 		int numfds = 0;
 
-		int res = curl_multi_wait(pDockerContainerInstances->curlm, NULL, 0, 1000, &numfds);
+		int res = curl_multi_wait(pInstances->curlm, NULL, 0, 1000, &numfds);
 		if (res != CURLM_OK) {
 			LogError(0, RS_RET_ERR, "error: curl_multi_wait() numfds=%d, res=%d:%s\n",
 					numfds, res, curl_multi_strerror(res));
@@ -1667,15 +1720,15 @@ processAndPollContainerLogs(docker_cont_log_instances_t *pDockerContainerInstanc
 		}
 
 		int prev_still_running = still_running;
-		curl_multi_perform(pDockerContainerInstances->curlm, &still_running);
+		curl_multi_perform(pInstances->curlm, &still_running);
 
 		if (prev_still_running > still_running) {
-			cleanupCompletedContainerRequests(pDockerContainerInstances);
+			cleanupCompletedContainerRequests(pInstances);
 		}
 
 	} while (still_running && glbl.GetGlobalInputTermState() == 0);
 
-	cleanupCompletedContainerRequests(pDockerContainerInstances);
+	cleanupCompletedContainerRequests(pInstances);
 
 	RETiRet;
 }
@@ -1694,29 +1747,32 @@ getContainersTask(void *pdata) {
 /* This function is called to gather input. */
 BEGINrunInput
 	rsRetVal localRet = RS_RET_OK;
-	docker_cont_log_instances_t *pDockerContainerInstances=NULL;
+	docker_cont_log_instances_t *pInstances=NULL;
 	pthread_t thrd_id; /* the worker's thread ID */
 	pthread_attr_t thrd_attr;
 	int get_containers_thread_initialized = 0;
+	time_t now;
 CODESTARTrunInput
+	datetime.GetTime(&now);
 
 	CHKiRet(ratelimitNew(&ratelimiter, "imdocker", NULL));
 	curl_global_init(CURL_GLOBAL_ALL);
-	localRet = dockerContLogReqsNew(&pDockerContainerInstances);
+	localRet = dockerContLogReqsNew(&pInstances);
 	if (localRet != RS_RET_OK) {
 		return localRet;
 	}
+	pInstances->time_started = now;
 
 	/* get all current containers now */
-	CHKiRet(getContainerIdsAndAppend(true, pDockerContainerInstances));
+	CHKiRet(getContainerIdsAndAppend(true, pInstances));
 
 	/* using default stacksize */
 	CHKiConcCtrl(pthread_attr_init(&thrd_attr));
-	CHKiConcCtrl(pthread_create(&thrd_id, &thrd_attr, getContainersTask, pDockerContainerInstances));
+	CHKiConcCtrl(pthread_create(&thrd_id, &thrd_attr, getContainersTask, pInstances));
 	get_containers_thread_initialized = 1;
 
 	while(glbl.GetGlobalInputTermState() == 0) {
-		CHKiRet(processAndPollContainerLogs(pDockerContainerInstances));
+		CHKiRet(processAndPollContainerLogs(pInstances));
 		if (glbl.GetGlobalInputTermState() == 0) {
 			/* exited from processAndPollContainerLogs, sleep before retrying */
 			srSleep(1, 10);
@@ -1729,8 +1785,8 @@ finalize_it:
 		pthread_join(thrd_id, NULL);
 		pthread_attr_destroy(&thrd_attr);
 	}
-	if (pDockerContainerInstances) {
-		dockerContLogReqsDestruct(pDockerContainerInstances);
+	if (pInstances) {
+		dockerContLogReqsDestruct(pInstances);
 	}
 	if (ratelimiter) {
 		ratelimitDestruct(ratelimiter);

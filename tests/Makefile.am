@@ -803,11 +803,13 @@ if ENABLE_IMDOCKER
 if ENABLE_IMDOCKER_TESTS
 TESTS += \
 	imdocker-unittests.sh \
+	imdocker-basic.sh \
 	imdocker-long-logline.sh \
 	imdocker-new-logs-from-start.sh \
 	imdocker-multi-line.sh
 if HAVE_VALGRIND
 TESTS +=  \
+	imdocker-basic-vg.sh \
 	imdocker-long-logline-vg.sh \
 	imdocker-new-logs-from-start-vg.sh \
 	imdocker-multi-line-vg.sh
