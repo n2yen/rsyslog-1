@@ -21,12 +21,17 @@
 #include <errno.h>
 #include <sys/types.h>
 #include <assert.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <json.h>
+#include <sys/stat.h>
 
 #include "rsyslog.h"
 #include "srUtils.h"
 #include "errmsg.h"
 #include "rsconf.h"
 #include "unicode-helper.h"
+#include "hashtable_itr.h"
 
 /* definitions for objects we access */
 DEFobjStaticHelpers
@@ -36,20 +41,27 @@ DEFobjCurrIf(statsobj)
 #define DYNSTATS_PARAM_RESETTABLE "resettable"
 #define DYNSTATS_PARAM_MAX_CARDINALITY "maxCardinality"
 #define DYNSTATS_PARAM_UNUSED_METRIC_LIFE "unusedMetricLife" /* in seconds */
+#define DYNSTATS_PARAM_PERSISTSTATEINTERVAL "persistStateInterval"
+#define DYNSTATS_PARAM_STATEFILE_DIRECTORY "statefile.directory"
 
 #define DYNSTATS_DEFAULT_RESETTABILITY 1
 #define DYNSTATS_DEFAULT_MAX_CARDINALITY 2000
 #define DYNSTATS_DEFAULT_UNUSED_METRIC_LIFE 3600 /* seconds */
+#define DYNSTATS_DEFAULT_PERSISTSTATEINTERVAL 0  /* seconds, default is 0, or never */
 
 #define DYNSTATS_MAX_BUCKET_NS_METRIC_LENGTH 100
 #define DYNSTATS_METRIC_NAME_SEPARATOR '.'
 #define DYNSTATS_HASHTABLE_SIZE_OVERPROVISIONING 1.25
+#define DYNSTATS_BUCKET_PERSIST_NAME "name"
+#define DYNSTATS_BUCKET_PERSIST_VALUES_NAME "values"
 
 static struct cnfparamdescr modpdescr[] = {
 	{ DYNSTATS_PARAM_NAME, eCmdHdlrString, CNFPARAM_REQUIRED },
 	{ DYNSTATS_PARAM_RESETTABLE, eCmdHdlrBinary, 0 },
 	{ DYNSTATS_PARAM_MAX_CARDINALITY, eCmdHdlrPositiveInt, 0},
-	{ DYNSTATS_PARAM_UNUSED_METRIC_LIFE, eCmdHdlrPositiveInt, 0} /* in minutes */
+	{ DYNSTATS_PARAM_UNUSED_METRIC_LIFE, eCmdHdlrPositiveInt, 0}, /* in minutes */
+	{ DYNSTATS_PARAM_PERSISTSTATEINTERVAL, eCmdHdlrPositiveInt, 0 },
+	{ DYNSTATS_PARAM_STATEFILE_DIRECTORY, eCmdHdlrString, 0 }
 };
 
 static struct cnfparamblk modpblk =
@@ -58,6 +70,13 @@ static struct cnfparamblk modpblk =
 	sizeof(modpdescr)/sizeof(struct cnfparamdescr),
 	modpdescr
 };
+
+static rsRetVal dynstats_addNewCtr(dynstats_bucket_t *b, const uchar* metric, uint8_t doInitialIncrement,
+		uint64_t doInitialOffset);
+static int getFullStateFileName(dynstats_bucket_t *b, uchar* pszstatefile, uchar* pszout, int buflen);
+static uchar* getStateFileName(const dynstats_bucket_t *const pbucket,
+		uchar *const __restrict__ buf, const size_t lenbuf) ATTR_NONNULL(1, 2);
+static rsRetVal persistBucketState(dynstats_bucket_t *b) ATTR_NONNULL(1);
 
 rsRetVal
 dynstatsClassInit(void) {
@@ -102,11 +121,15 @@ dynstats_destroyBucket(dynstats_bucket_t* b) {
 
 	bkts = &loadConf->dynstats_buckets;
 
+	if(b->persistStateInterval) {
+		persistBucketState(b);
+	}
 	pthread_rwlock_wrlock(&b->lock);
 	dynstats_destroyCounters(b);
 	dynstats_destroyCountersIn(b, b->survivor_table, b->survivor_ctrs);
 	statsobj.Destruct(&b->stats);
 	free(b->name);
+	free(b->stateFileDirectory);
 	pthread_rwlock_unlock(&b->lock);
 	pthread_rwlock_destroy(&b->lock);
 	pthread_mutex_destroy(&b->mutMetricCount);
@@ -292,20 +315,82 @@ dynstats_readCallback(statsobj_t __attribute__((unused)) *ignore, void *b) {
 static rsRetVal
 dynstats_initNewBucketStats(dynstats_bucket_t *b) {
 	DEFiRet;
-	
+
 	CHKiRet(statsobj.Construct(&b->stats));
 	CHKiRet(statsobj.SetOrigin(b->stats, UCHAR_CONSTANT("dynstats.bucket")));
 	CHKiRet(statsobj.SetName(b->stats, b->name));
 	CHKiRet(statsobj.SetReportingNamespace(b->stats, UCHAR_CONSTANT("values")));
 	statsobj.SetReadNotifier(b->stats, dynstats_readCallback, b);
 	CHKiRet(statsobj.ConstructFinalize(b->stats));
-	
+
+finalize_it:
+	RETiRet;
+}
+
+/* try to open a file which has a state file. If the state file does not
+ * exist or cannot be read, an error is returned.
+ */
+static rsRetVal ATTR_NONNULL(1) openFileWithStateFile(dynstats_bucket_t *b) {
+	DEFiRet;
+	struct stat stat_buf;
+	uchar statefile[MAXFNAME];
+	uchar statefname[MAXFNAME];
+
+	uchar *const statefn = getStateFileName(b, statefile, sizeof(statefile));
+	assert(statefn);
+	/* Get full path and file name */
+	getFullStateFileName(b, statefn, statefname, sizeof(statefname));
+	DBGPRINTF("opening statefile for '%s', state file '%s'\n", b->name, statefname);
+
+	/* check if the file exists */
+	if(stat((char*) statefname, &stat_buf) == -1) {
+		LogMsg(0, RS_RET_FILE_NOT_FOUND, LOG_INFO,
+				"dyn_stats: warning state file doesn't exist: '%s'", statefname);
+		FINALIZE;
+	}
+
+	json_object *json_obj = fjson_object_from_file((const char*)statefname);
+	if (!json_obj) {
+		LogMsg(0, RS_RET_JSON_UNUSABLE, LOG_INFO,
+				"dyn_stats: error couldn't read json from file.");
+		FINALIZE;
+	}
+
+	/* expected json format
+	 * { "name": "bucketname" "values": { "foo": "1" } }
+	 */
+
+	json_object *json_obj_metrics = NULL;
+	if (json_object_object_get_ex(json_obj, DYNSTATS_BUCKET_PERSIST_VALUES_NAME, &json_obj_metrics)) {
+		struct json_object_iterator it, itEnd;
+		for (it = json_object_iter_begin(json_obj_metrics), itEnd = json_object_iter_end(json_obj_metrics);
+				!json_object_iter_equal(&it, &itEnd);
+				json_object_iter_next(&it)) {
+			const uchar *metric = (const uchar*)json_object_iter_peek_name(&it);
+			uint64_t val = json_object_get_int64(json_object_iter_peek_value(&it));
+			// now add the counter to the bucket with offset
+			dynstats_addNewCtr(b, metric, 0, val);
+		}
+	}
+	json_object_put(json_obj);
+
 finalize_it:
 	RETiRet;
 }
 
 static rsRetVal
-dynstats_newBucket(const uchar* name, uint8_t resettable, uint32_t maxCardinality, uint32_t unusedMetricLife) {
+dynstats_openStateFile(dynstats_bucket_t *b) {
+	DEFiRet;
+
+	CHKiRet(openFileWithStateFile(b));
+
+finalize_it:
+	RETiRet;
+}
+
+static rsRetVal
+dynstats_newBucket(const uchar* name, uint8_t resettable, uint32_t maxCardinality, uint32_t unusedMetricLife,
+		uint32_t persistStateInterval, const uchar *stateFileDirectory) {
 	dynstats_bucket_t *b;
 	dynstats_buckets_t *bkts;
 	uint8_t lock_initialized, metric_count_mutex_initialized;
@@ -314,7 +399,7 @@ dynstats_newBucket(const uchar* name, uint8_t resettable, uint32_t maxCardinalit
 
 	lock_initialized = metric_count_mutex_initialized = 0;
 	b = NULL;
-	
+
 	bkts = &loadConf->dynstats_buckets;
 
 	if (bkts->initialized) {
@@ -322,7 +407,12 @@ dynstats_newBucket(const uchar* name, uint8_t resettable, uint32_t maxCardinalit
 		b->resettable = resettable;
 		b->maxCardinality = maxCardinality;
 		b->unusedMetricLife = 1000 * unusedMetricLife;
+		b->persistStateInterval = persistStateInterval;
+		b->nUpdates = 0;
 		CHKmalloc(b->name = ustrdup(name));
+		if (stateFileDirectory) {
+			CHKmalloc(b->stateFileDirectory = ustrdup(stateFileDirectory));
+		}
 
 		pthread_rwlockattr_init(&bucket_lock_attr);
 #ifdef HAVE_PTHREAD_RWLOCKATTR_SETKIND_NP
@@ -373,16 +463,18 @@ dynstats_processCnf(struct cnfobj *o) {
 	struct cnfparamvals *pvals;
 	short i;
 	uchar *name = NULL;
+	uchar *stateFileDirectory = NULL;
 	uint8_t resettable = DYNSTATS_DEFAULT_RESETTABILITY;
 	uint32_t maxCardinality = DYNSTATS_DEFAULT_MAX_CARDINALITY;
 	uint32_t unusedMetricLife = DYNSTATS_DEFAULT_UNUSED_METRIC_LIFE;
+	uint32_t persistStateInterval = DYNSTATS_DEFAULT_PERSISTSTATEINTERVAL;
 	DEFiRet;
 
 	pvals = nvlstGetParams(o->nvlst, &modpblk, NULL);
 	if(pvals == NULL) {
 		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
 	}
-	
+
 	for(i = 0 ; i < modpblk.nParams ; ++i) {
 		if(!pvals[i].bUsed)
 			continue;
@@ -394,17 +486,23 @@ dynstats_processCnf(struct cnfobj *o) {
 			maxCardinality = (uint32_t) pvals[i].val.d.n;
 		} else if (!strcmp(modpblk.descr[i].name, DYNSTATS_PARAM_UNUSED_METRIC_LIFE)) {
 			unusedMetricLife = (uint32_t) pvals[i].val.d.n;
+		} else if (!strcmp(modpblk.descr[i].name, DYNSTATS_PARAM_PERSISTSTATEINTERVAL)) {
+			persistStateInterval = (uint32_t) pvals[i].val.d.n;
+		} else if (!strcmp(modpblk.descr[i].name, DYNSTATS_PARAM_STATEFILE_DIRECTORY)) {
+			CHKmalloc(stateFileDirectory = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL));
 		} else {
 			dbgprintf("dyn_stats: program error, non-handled "
 					  "param '%s'\n", modpblk.descr[i].name);
 		}
 	}
 	if (name != NULL) {
-		CHKiRet(dynstats_newBucket(name, resettable, maxCardinality, unusedMetricLife));
+		CHKiRet(dynstats_newBucket(name, resettable, maxCardinality, unusedMetricLife,
+					persistStateInterval, stateFileDirectory));
 	}
 
 finalize_it:
 	free(name);
+	free(stateFileDirectory);
 	cnfparamvalsDestruct(pvals, &modpblk);
 	RETiRet;
 }
@@ -414,7 +512,7 @@ dynstats_initCnf(dynstats_buckets_t *bkts) {
 	DEFiRet;
 
 	bkts->initialized = 0;
-	
+
 	bkts->list = NULL;
 	CHKiRet(statsobj.Construct(&bkts->global_stats));
 	CHKiRet(statsobj.SetOrigin(bkts->global_stats, UCHAR_CONSTANT("dynstats")));
@@ -424,7 +522,7 @@ dynstats_initCnf(dynstats_buckets_t *bkts) {
 	pthread_rwlock_init(&bkts->lock, NULL);
 
 	bkts->initialized = 1;
-	
+
 finalize_it:
 	if (iRet != RS_RET_OK) {
 		statsobj.Destruct(&bkts->global_stats);
@@ -468,6 +566,10 @@ dynstats_findBucket(const uchar* name) {
 			}
 			b = b->next;
 		}
+
+		if (b && b->persistStateInterval) {
+			dynstats_openStateFile(b);
+		}
 		pthread_rwlock_unlock(&bkts->lock);
 	} else {
 		b = NULL;
@@ -481,7 +583,7 @@ dynstats_findBucket(const uchar* name) {
 static rsRetVal
 dynstats_createCtr(dynstats_bucket_t *b, const uchar* metric, dynstats_ctr_t **ctr) {
 	DEFiRet;
-	
+
 	CHKmalloc(*ctr = calloc(1, sizeof(dynstats_ctr_t)));
 	CHKmalloc((*ctr)->metric = ustrdup(metric));
 	STATSCOUNTER_INIT((*ctr)->ctr, (*ctr)->mutCtr);
@@ -499,12 +601,151 @@ finalize_it:
 	RETiRet;
 }
 
+/* not supported in older platforms - disable */
+#ifndef O_CLOEXEC
+#define O_CLOEXEC 0
+#endif
+/*
+ *	Helper function adapted from imfile of the same name - possible candidate for refactor.
+ */
+static rsRetVal ATTR_NONNULL()
+atomicWriteStateFile(const char *fn, const char *content) {
+	DEFiRet;
+	const int fd = open(fn, O_CLOEXEC | O_NOCTTY | O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	if(fd < 0) {
+		LogError(errno, RS_RET_IO_ERROR, "dynstats: cannot open state file '%s' for "
+			"persisting file state - some data will probably be duplicated "
+			"on next startup", fn);
+		ABORT_FINALIZE(RS_RET_IO_ERROR);
+	}
+
+	const size_t toWrite = strlen(content);
+	const ssize_t w = write(fd, content, toWrite);
+	if(w != (ssize_t) toWrite) {
+		LogError(errno, RS_RET_IO_ERROR, "dynstats: partial write to state file '%s' "
+			"this may cause trouble in the future. We will try to delete the "
+			"state file, as this provides most consistent state", fn);
+		unlink(fn);
+		ABORT_FINALIZE(RS_RET_IO_ERROR);
+	}
+
+finalize_it:
+	if(fd >= 0) {
+		close(fd);
+	}
+	RETiRet;
+}
+
+static const uchar *
+getStateFileDir(dynstats_bucket_t *b)
+{
+	const uchar *wrkdir;
+	assert(b != NULL);
+	if (b->stateFileDirectory == NULL) {
+		wrkdir = glblGetWorkDirRaw();
+	} else {
+		wrkdir = b->stateFileDirectory;
+	}
+	return(wrkdir);
+}
+
+/*
+*	Helper function to combine statefile and workdir
+*/
+static int getFullStateFileName(dynstats_bucket_t *b, uchar* pszstatefile, uchar* pszout, int buflen)
+{
+	int lenout;
+	const uchar* pszworkdir;
+
+	/* Get Raw Workdir, if it is NULL we need to propper handle it */
+	pszworkdir = getStateFileDir(b);
+
+	/* Construct file name */
+	lenout = snprintf((char*)pszout, buflen, "%s/%s",
+					(char*) (pszworkdir == NULL ? "." : (char*) pszworkdir), (char*)pszstatefile);
+
+	/* return out length */
+	return lenout;
+}
+
+/* this generates a state file name suitable for the given file. To avoid
+ * malloc calls, it must be passed a buffer which should be MAXFNAME large.
+ * Note: the buffer is not necessarily populated ... always ONLY use the
+ * RETURN VALUE!
+ * This function is guranteed to work only on config data and DOES NOT
+ * open or otherwise modify disk file state.
+ */
+static uchar * ATTR_NONNULL(1, 2)
+getStateFileName(const dynstats_bucket_t *const pbucket,
+		uchar *const __restrict__ buf,
+		const size_t lenbuf) {
+
+	DBGPRINTF("getStateFileName for '%s'\n", pbucket->name);
+	snprintf((char*)buf, lenbuf - 1, "dynstats-state:%s", pbucket->name);
+	DBGPRINTF("getStateFileName:  state file name now is %s\n", buf);
+	return buf;
+}
+
+/* This function persists dynstats_bucket_t data, which for the time being:
+ * metric bucket counters
+ */
+static rsRetVal ATTR_NONNULL(1)
+persistBucketState(dynstats_bucket_t *b) {
+	DEFiRet;
+	uchar statefile[MAXFNAME];
+	uchar statefname[MAXFNAME];
+	struct json_object *jval = NULL;
+	struct json_object *json = NULL;
+	struct json_object *json_bucket_values = NULL;
+
+	assert (b->name);
+	uchar *const statefn = getStateFileName(b, statefile, sizeof(statefile));
+	/* Get full path and file name */
+	getFullStateFileName(b, statefn, statefname, sizeof(statefname));
+	DBGPRINTF("persisting state for '%s', state file '%s'\n", b->name, statefname);
+
+	CHKmalloc(json = json_object_new_object());
+	jval = json_object_new_string((char*) b->name);
+	json_object_object_add(json, DYNSTATS_BUCKET_PERSIST_NAME, jval);
+
+	// walk the hashtable and create a val for each
+	CHKmalloc(json_bucket_values = json_object_new_object());
+	json_object_object_add(json, DYNSTATS_BUCKET_PERSIST_VALUES_NAME, json_bucket_values);
+
+	pthread_rwlock_rdlock(&b->lock);
+	if (hashtable_count(b->table) > 0) {
+		struct hashtable_itr *itr = hashtable_iterator(b->table);
+		dynstats_ctr_t *pctr = NULL;
+		do {
+			pctr = (dynstats_ctr_t*) hashtable_iterator_value(itr);
+			jval = json_object_new_int64(pctr->ctr);
+			json_object_object_add(json_bucket_values, (const char*)pctr->metric, jval);
+		} while (hashtable_iterator_advance(itr));
+		free(itr);
+	}
+	pthread_rwlock_unlock(&b->lock);
+
+	const char *jstr =  json_object_to_json_string_ext(json, JSON_C_TO_STRING_SPACED);
+	CHKiRet(atomicWriteStateFile((const char*)statefname, jstr));
+
+finalize_it:
+	if(iRet != RS_RET_OK) {
+		LogError(0, iRet, "dynstats: could not persist state "
+				"file %s - data may be repeated on next "
+				"startup. Is WorkDirectory set?",
+				statefname);
+	}
+	json_object_put(json);
+
+	RETiRet;
+}
+
 #if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wmaybe-uninitialized" /* TODO: how can we fix these warnings? */
 #endif
 static rsRetVal
-dynstats_addNewCtr(dynstats_bucket_t *b, const uchar* metric, uint8_t doInitialIncrement) {
+dynstats_addNewCtr(dynstats_bucket_t *b, const uchar* metric, uint8_t doInitialIncrement, uint64_t doInitialOffset) {
 	dynstats_ctr_t *ctr;
 	dynstats_ctr_t *found_ctr, *survivor_ctr, *effective_ctr;
 	int created;
@@ -517,7 +758,7 @@ dynstats_addNewCtr(dynstats_bucket_t *b, const uchar* metric, uint8_t doInitialI
 	if ((unsigned) ATOMIC_FETCH_32BIT_unsigned(&b->metricCount, &b->mutMetricCount) >= b->maxCardinality) {
 		ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
 	}
-	
+
 	CHKiRet(dynstats_createCtr(b, metric, &ctr));
 
 	pthread_rwlock_wrlock(&b->lock);
@@ -558,6 +799,10 @@ dynstats_addNewCtr(dynstats_bucket_t *b, const uchar* metric, uint8_t doInitialI
 			if (doInitialIncrement) {
 				STATSCOUNTER_INC(effective_ctr->ctr, effective_ctr->mutCtr);
 			}
+			if (doInitialOffset) {
+				// doInitialOffset regardless of the state of GatherStats
+				ATOMIC_ADD_uint64(&effective_ctr->ctr, &effective_ctr->mutCtr, doInitialOffset);
+			}
 		}
 	}
 	pthread_rwlock_unlock(&b->lock);
@@ -573,7 +818,7 @@ dynstats_addNewCtr(dynstats_bucket_t *b, const uchar* metric, uint8_t doInitialI
 		}
 		ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
 	}
-	
+
 finalize_it:
 	if (((! created) || (effective_ctr != ctr)) && (ctr != NULL)) {
 		dynstats_destroyCtr(ctr);
@@ -586,7 +831,7 @@ finalize_it:
 
 rsRetVal
 dynstats_inc(dynstats_bucket_t *b, uchar* metric) {
-	dynstats_ctr_t *ctr;
+	dynstats_ctr_t *ctr = NULL;
 	DEFiRet;
 
 	if (! GatherStats) {
@@ -609,7 +854,7 @@ dynstats_inc(dynstats_bucket_t *b, uchar* metric) {
 	}
 
 	if (ctr == NULL) {
-		CHKiRet(dynstats_addNewCtr(b, metric, 1));
+		CHKiRet(dynstats_addNewCtr(b, metric, 1, 0));
 	}
 finalize_it:
 	if (iRet != RS_RET_OK) {
@@ -620,6 +865,11 @@ finalize_it:
 		} else {
 			STATSCOUNTER_INC(b->ctrOpsOverflow, b->mutCtrOpsOverflow);
 		}
+	}
+
+	if(b->persistStateInterval > 0 && ++b->nUpdates >= b->persistStateInterval) {
+		persistBucketState(b);
+		b->nUpdates = 0;
 	}
 	RETiRet;
 }
