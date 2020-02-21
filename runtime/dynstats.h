@@ -55,7 +55,7 @@ struct dynstats_bucket_s {
 	  accumulator value from this */
 	struct dynstats_ctr_s *survivor_ctrs;
 	htable *survivor_table;
-	
+
 	uint32_t maxCardinality;
 	uint32_t metricCount;
 	pthread_mutex_t mutMetricCount;
@@ -63,6 +63,9 @@ struct dynstats_bucket_s {
 	uint32_t lastResetTs;
 	struct timespec metricCleanupTimeout;
 	uint8_t resettable;
+	uchar *stateFileDirectory;
+	uint32_t persistStateInterval;
+	uint32_t nUpdates; /* number of bucket updates before persisting the stream */
 };
 
 struct dynstats_buckets_s {
