@@ -20,6 +20,8 @@
 
 #include "hashtable.h"
 
+#include "perctile_stats.h"
+
 typedef struct hashtable htable;
 
 struct dynstats_ctr_s {
@@ -70,6 +72,13 @@ struct dynstats_buckets_s {
 	statsobj_t *global_stats;
 	pthread_rwlock_t lock;
 	uint8_t initialized;
+
+	// perctile stuff
+	struct perctile_bucket_s *listPerctileBuckets;
+	pthread_rwlock_t perctile_lock;
+	// TODO: clean up this stuff
+	//uint8_t perctile_initialized;
+	// end perctile
 };
 
 rsRetVal dynstats_initCnf(dynstats_buckets_t *b);
@@ -80,4 +89,11 @@ void dynstats_destroyAllBuckets(void);
 void dynstats_resetExpired(void);
 rsRetVal dynstatsClassInit(void);
 
+/* new perctile related functions */
+perctile_bucket_t* dynstats_perctile_findBucket(const uchar* name);
+rsRetVal dynstats_perctile_obs(perctile_bucket_t *perctile_bkt, uchar* key, int64_t value); 
+rsRetVal dynstats_perctileInitNewBucketStats(dynstats_buckets_t *bkts, perctile_bucket_t *b);
+rsRetVal dynstats_initAndAddPerctileMetrics(perctile_bucket_t *bkt, perctile_stat_t *pstat);
+void dynstats_perctileDestroyPerctileStats(statsobj_t *pobj);
+	
 #endif /* #ifndef INCLUDED_DYNSTATS_H */

@@ -59,6 +59,8 @@ librsyslog_la_SOURCES = \
 	statsobj.h \
 	dynstats.c \
 	dynstats.h \
+	perctile_stats.c \
+	perctile_stats.h \
 	statsobj.h \
 	stream.c \
 	stream.h \
