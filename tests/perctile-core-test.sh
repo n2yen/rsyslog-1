@@ -10,12 +10,11 @@ ruleset(name="stats") {
 module(load="../plugins/imfile/.libs/imfile")
 input(type="imfile" File="./testsuites/core-test.log" tag="file:")
 module(load="../plugins/impstats/.libs/impstats" interval="1" severity="7" resetCounters="on" Ruleset="stats" bracketing="on")
-#template(name="outfmt" type="string" string="%$.ts% %msg%\n")
-#template(name="timestamp" type="string" string="%$.ts% %msg%  %$.ts_parse% %$.ts_epochtime% \n")
 template(name="timestamp" type="string" string="%$.ts% %msg%  %$.ts_parse% %$.ts_epochtime% %$.millis% %.delta_millis%\n")
 
 # for now, we only check if type is set to something
-dyn_stats(name="core-lag" type="yes" percentiles=["95", "50"] windowsize="32000" )
+#dyn_stats(name="core-lag" type="yes" percentiles=["95", "50"] windowsize="32000" )
+perctile_stats(name="core-lag" percentiles=["95", "50"] windowsize="32000" )
 
 # extract timestamp using tilde
 set $.ts = field($msg, 96, 2);
@@ -37,7 +36,8 @@ set $.delta_millis = 1000*($.ts_cur_epoch - $.ts_epochtime) - $.millis;
 action(type="omfile" file="'${RSYSLOG_DYNNAME}'.ts" template="timestamp")
 
 # do a test observe here.
-set $.status = dyn_perctile_observe("core-lag", "core-test.log", $.delta_millis);
+#set $.status = dyn_perctile_observe("core-lag", "core-test.log", $.delta_millis);
+set $.status = perctile_observe("core-lag", "core-test.log", $.delta_millis);
 '
 
 startup

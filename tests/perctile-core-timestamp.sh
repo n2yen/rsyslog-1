@@ -12,10 +12,11 @@ input(type="imfile" File="./testsuites/core-test.log" tag="file:")
 module(load="../plugins/impstats/.libs/impstats" interval="1" severity="7" resetCounters="on" Ruleset="stats" bracketing="on")
 #template(name="outfmt" type="string" string="%msg%\n")
 #template(name="timestamp" type="string" string="%$.ts% %msg%  %$.ts_parse% %$.ts_epochtime% \n")
-template(name="timestamp" type="string" string="%$.ts% %msg%  %$.ts_parse% %$.ts_epochtime% %$.millis% %.delta_millis%\n")
+template(name="timestamp" type="string" string="%$.ts% %msg%  %$.ts_parse% %$.ts_epochtime% %$.millis% %$.delta1% %$.delta2% %$.delta_delta% %.delta_millis%\n")
 
 # for now, we only check if type is set to something
 #dyn_stats(name="core-lag" type="yes" percentiles=["95", "50"] windowsize="32000" )
+perctile_stats(name="core-lag" percentiles=["95", "50"] windowsize="32000")
 
 # extract timestamp using tilde
 set $.ts = field($msg, 96, 2);
@@ -30,15 +31,21 @@ set $.ts_parse = substring($.ts, 0, 4) & "-" & substring($.ts, 4, 2) & "-" & sub
 									& substring($.ts, 8, 2) & ":" & substring($.ts, 10, 2) & ":" & substring($.ts, 12, 2) & "Z";
 set $.ts_epochtime = parse_time($.ts_parse);
 
-set $.ts_cur_epoch = "2020-04-01T10:06:18.986Z";
+set $.ts_cur_epoch = "2020-04-14T10:06:18.986Z";
 set $.ts_cur_epoch = parse_time($.ts_cur_epoch);
+set $.ts_rsyslog_cur1 = parse_time($timegenerated);
+set $.ts_rsyslog_cur2 = parse_time($timereported);
 set $.millis = field($.ts, 46, 2);
-set $.delta_millis = 1000*($.ts_cur_epoch - $.ts_epochtime) - $.millis;
-#action(type="omfile" file="'${RSYSLOG_DYNNAME}'.ts" template="timestamp")
-action(type="omfile" file="'${RSYSLOG_DYNNAME}'.ts" template="outfmt")
+set $.delta1 = 1000*($.ts_rsyslog_cur1 - $.ts_epochtime);
+set $.delta2 = 1000*($.ts_rsyslog_cur2 - $.ts_epochtime);
+#set $.delta_millis = 1000*($.ts_cur_epoch - $.ts_epochtime) - $.millis;
+set $.delta_millis = $.delta1 - $.millis;
+set $.delta_millis2 = $.delta2 - $.millis;
+action(type="omfile" file="'${RSYSLOG_DYNNAME}'.ts" template="timestamp")
 
 # do a test observe here.
 #set $.status = dyn_perctile_observe("core-lag", "core-test.log", $.delta_millis);
+set $.status = perctile_observe("core-lag", "core-test.log", $.delta_millis);
 '
 
 startup

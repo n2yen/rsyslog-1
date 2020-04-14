@@ -28,8 +28,6 @@
 #include "rsconf.h"
 #include "unicode-helper.h"
 
-#include "perctile_stats.h"
-
 /* definitions for objects we access */
 DEFobjStaticHelpers
 DEFobjCurrIf(statsobj)
@@ -51,11 +49,7 @@ static struct cnfparamdescr modpdescr[] = {
 	{ DYNSTATS_PARAM_NAME, eCmdHdlrString, CNFPARAM_REQUIRED },
 	{ DYNSTATS_PARAM_RESETTABLE, eCmdHdlrBinary, 0 },
 	{ DYNSTATS_PARAM_MAX_CARDINALITY, eCmdHdlrPositiveInt, 0},
-	{ DYNSTATS_PARAM_UNUSED_METRIC_LIFE, eCmdHdlrPositiveInt, 0}, /* in minutes */
-	/* perctile related stuff */
-	{ PERCTILE_PARAM_TYPE, eCmdHdlrString, 0},
-	{ PERCTILE_PARAM_PERCENTILES, eCmdHdlrArray, 0},
-	{ PERCTILE_PARAM_WINDOW_SIZE, eCmdHdlrPositiveInt, 0},
+	{ DYNSTATS_PARAM_UNUSED_METRIC_LIFE, eCmdHdlrPositiveInt, 0} /* in minutes */
 };
 
 static struct cnfparamblk modpblk =
@@ -144,7 +138,7 @@ dynstats_addBucketMetrics(dynstats_buckets_t *bkts, dynstats_bucket_t *b, const 
 	ustrncpy(metric_suffix, suffix_litteral, DYNSTATS_MAX_BUCKET_NS_METRIC_LENGTH);
 	STATSCOUNTER_INIT(b->ctrOpsOverflow, b->mutCtrOpsOverflow);
 	CHKiRet(statsobj.AddManagedCounter(bkts->global_stats, metric_name_buff, ctrType_IntCtr,
-										 CTR_FLAG_RESETTABLE,
+									   CTR_FLAG_RESETTABLE,
 										&(b->ctrOpsOverflow),
 										&b->pOpsOverflowCtr, 1));
 
@@ -152,7 +146,7 @@ dynstats_addBucketMetrics(dynstats_buckets_t *bkts, dynstats_bucket_t *b, const 
 	ustrncpy(metric_suffix, suffix_litteral, DYNSTATS_MAX_BUCKET_NS_METRIC_LENGTH);
 	STATSCOUNTER_INIT(b->ctrNewMetricAdd, b->mutCtrNewMetricAdd);
 	CHKiRet(statsobj.AddManagedCounter(bkts->global_stats, metric_name_buff, ctrType_IntCtr,
-										 CTR_FLAG_RESETTABLE,
+									   CTR_FLAG_RESETTABLE,
 										&(b->ctrNewMetricAdd),
 										&b->pNewMetricAddCtr, 1));
 
@@ -160,7 +154,7 @@ dynstats_addBucketMetrics(dynstats_buckets_t *bkts, dynstats_bucket_t *b, const 
 	ustrncpy(metric_suffix, suffix_litteral, DYNSTATS_MAX_BUCKET_NS_METRIC_LENGTH);
 	STATSCOUNTER_INIT(b->ctrNoMetric, b->mutCtrNoMetric);
 	CHKiRet(statsobj.AddManagedCounter(bkts->global_stats, metric_name_buff, ctrType_IntCtr,
-										 CTR_FLAG_RESETTABLE,
+									   CTR_FLAG_RESETTABLE,
 										&(b->ctrNoMetric),
 										&b->pNoMetricCtr, 1));
 
@@ -168,7 +162,7 @@ dynstats_addBucketMetrics(dynstats_buckets_t *bkts, dynstats_bucket_t *b, const 
 	ustrncpy(metric_suffix, suffix_litteral, DYNSTATS_MAX_BUCKET_NS_METRIC_LENGTH);
 	STATSCOUNTER_INIT(b->ctrMetricsPurged, b->mutCtrMetricsPurged);
 	CHKiRet(statsobj.AddManagedCounter(bkts->global_stats, metric_name_buff, ctrType_IntCtr,
-										 CTR_FLAG_RESETTABLE,
+									   CTR_FLAG_RESETTABLE,
 										&(b->ctrMetricsPurged),
 										&b->pMetricsPurgedCtr, 1));
 
@@ -176,7 +170,7 @@ dynstats_addBucketMetrics(dynstats_buckets_t *bkts, dynstats_bucket_t *b, const 
 	ustrncpy(metric_suffix, suffix_litteral, DYNSTATS_MAX_BUCKET_NS_METRIC_LENGTH);
 	STATSCOUNTER_INIT(b->ctrOpsIgnored, b->mutCtrOpsIgnored);
 	CHKiRet(statsobj.AddManagedCounter(bkts->global_stats, metric_name_buff, ctrType_IntCtr,
-										 CTR_FLAG_RESETTABLE,
+									   CTR_FLAG_RESETTABLE,
 										&(b->ctrOpsIgnored),
 										&b->pOpsIgnoredCtr, 1));
 
@@ -184,7 +178,7 @@ dynstats_addBucketMetrics(dynstats_buckets_t *bkts, dynstats_bucket_t *b, const 
 	ustrncpy(metric_suffix, suffix_litteral, DYNSTATS_MAX_BUCKET_NS_METRIC_LENGTH);
 	STATSCOUNTER_INIT(b->ctrPurgeTriggered, b->mutCtrPurgeTriggered);
 	CHKiRet(statsobj.AddManagedCounter(bkts->global_stats, metric_name_buff, ctrType_IntCtr,
-										 CTR_FLAG_RESETTABLE,
+									   CTR_FLAG_RESETTABLE,
 										&(b->ctrPurgeTriggered),
 										&b->pPurgeTriggeredCtr, 1));
 
@@ -310,93 +304,67 @@ finalize_it:
 	RETiRet;
 }
 
-
 static rsRetVal
-_dynstats_newBucket(dynstats_buckets_t *bkts, const uchar *name, uint8_t resettable, uint32_t maxCardinality, uint32_t unusedMetricLife) 
-{
+dynstats_newBucket(const uchar* name, uint8_t resettable, uint32_t maxCardinality, uint32_t unusedMetricLife) {
+	dynstats_bucket_t *b;
+	dynstats_buckets_t *bkts;
 	uint8_t lock_initialized, metric_count_mutex_initialized;
 	pthread_rwlockattr_t bucket_lock_attr;
-	dynstats_bucket_t *b;
 	DEFiRet;
 
 	lock_initialized = metric_count_mutex_initialized = 0;
-
-	CHKmalloc(b = calloc(1, sizeof(dynstats_bucket_t)));
-	b->resettable = resettable;
-	b->maxCardinality = maxCardinality;
-	b->unusedMetricLife = 1000 * unusedMetricLife;
-	CHKmalloc(b->name = ustrdup(name));
-
-	pthread_rwlockattr_init(&bucket_lock_attr);
-#ifdef HAVE_PTHREAD_RWLOCKATTR_SETKIND_NP
-	pthread_rwlockattr_setkind_np(&bucket_lock_attr, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
-#endif
-
-	pthread_rwlock_init(&b->lock, &bucket_lock_attr);
-	lock_initialized = 1;
-	pthread_mutex_init(&b->mutMetricCount, NULL);
-	metric_count_mutex_initialized = 1;
-
-	CHKiRet(dynstats_initNewBucketStats(b));
-
-	CHKiRet(dynstats_resetBucket(b));
-
-	CHKiRet(dynstats_addBucketMetrics(bkts, b, name));
-
-	pthread_rwlock_wrlock(&bkts->lock);
-	if (bkts->list == NULL)
-	{
-		bkts->list = b;
-	}
-	else
-	{
-		b->next = bkts->list;
-		bkts->list = b;
-	}
-	pthread_rwlock_unlock(&bkts->lock);
-finalize_it:
-	if (iRet != RS_RET_OK)
-	{
-		if (metric_count_mutex_initialized)
-		{
-			pthread_mutex_destroy(&b->mutMetricCount);
-		}
-		if (lock_initialized)
-		{
-			pthread_rwlock_destroy(&b->lock);
-		}
-		if (b != NULL)
-		{
-			dynstats_destroyBucket(b);
-		}
-	}
-	RETiRet;
-}
-
-static rsRetVal
-dynstats_newBucket(const uchar *name, uint8_t resettable, uint32_t maxCardinality, uint32_t unusedMetricLife, 
-									 /* these are percentile related fields */
-									 uint8_t perctile_type, uint8_t *perctiles, uint32_t perctilesCount, uint32_t windowSize)
-{
-	dynstats_buckets_t *bkts;
-	//uint8_t lock_initialized, metric_count_mutex_initialized;
-	//pthread_rwlockattr_t bucket_lock_attr;
-	DEFiRet;
-
+	b = NULL;
+	
 	bkts = &loadConf->dynstats_buckets;
 
 	if (bkts->initialized) {
-		if (!perctile_type) {
-			CHKiRet(_dynstats_newBucket(bkts, name, resettable, maxCardinality, unusedMetricLife));
+		CHKmalloc(b = calloc(1, sizeof(dynstats_bucket_t)));
+		b->resettable = resettable;
+		b->maxCardinality = maxCardinality;
+		b->unusedMetricLife = 1000 * unusedMetricLife;
+		CHKmalloc(b->name = ustrdup(name));
+
+		pthread_rwlockattr_init(&bucket_lock_attr);
+#ifdef HAVE_PTHREAD_RWLOCKATTR_SETKIND_NP
+		pthread_rwlockattr_setkind_np(&bucket_lock_attr, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+#endif
+
+		pthread_rwlock_init(&b->lock, &bucket_lock_attr);
+		lock_initialized = 1;
+		pthread_mutex_init(&b->mutMetricCount, NULL);
+		metric_count_mutex_initialized = 1;
+
+		CHKiRet(dynstats_initNewBucketStats(b));
+
+		CHKiRet(dynstats_resetBucket(b));
+
+		CHKiRet(dynstats_addBucketMetrics(bkts, b, name));
+
+		pthread_rwlock_wrlock(&bkts->lock);
+		if (bkts->list == NULL) {
+			bkts->list = b;
 		} else {
-			CHKiRet(perctile_newBucket(bkts, name, perctiles, perctilesCount, windowSize));
+			b->next = bkts->list;
+			bkts->list = b;
 		}
+		pthread_rwlock_unlock(&bkts->lock);
 	} else {
 		LogError(0, RS_RET_INTERNAL_ERROR, "dynstats: bucket creation failed, as "
 		"global-initialization of buckets was unsuccessful");
 		ABORT_FINALIZE(RS_RET_INTERNAL_ERROR);
 	}
 finalize_it:
+	if (iRet != RS_RET_OK) {
+		if (metric_count_mutex_initialized) {
+			pthread_mutex_destroy(&b->mutMetricCount);
+		}
+		if (lock_initialized) {
+			pthread_rwlock_destroy(&b->lock);
+		}
+		if (b != NULL) {
+			dynstats_destroyBucket(b);
+		}
+	}
 	RETiRet;
 }
 
@@ -408,14 +376,6 @@ dynstats_processCnf(struct cnfobj *o) {
 	uint8_t resettable = DYNSTATS_DEFAULT_RESETTABILITY;
 	uint32_t maxCardinality = DYNSTATS_DEFAULT_MAX_CARDINALITY;
 	uint32_t unusedMetricLife = DYNSTATS_DEFAULT_UNUSED_METRIC_LIFE;
-
-	// perctile params
-	uint8_t percentile_type = 0;
-	uint8_t *perctiles = NULL;
-	uint32_t perctilesCount = 0;
-	uint64_t windowSize = 0;
-	// end perctile params
-
 	DEFiRet;
 
 	pvals = nvlstGetParams(o->nvlst, &modpblk, NULL);
@@ -434,37 +394,17 @@ dynstats_processCnf(struct cnfobj *o) {
 			maxCardinality = (uint32_t) pvals[i].val.d.n;
 		} else if (!strcmp(modpblk.descr[i].name, DYNSTATS_PARAM_UNUSED_METRIC_LIFE)) {
 			unusedMetricLife = (uint32_t) pvals[i].val.d.n;
-		} 
-		// Everything under here is for POC of percentile
-		else if (!strcmp(modpblk.descr[i].name, PERCTILE_PARAM_TYPE)) {
-			percentile_type = 1;
-		} else if (!strcmp(modpblk.descr[i].name, PERCTILE_PARAM_PERCENTILES)) {
-			perctilesCount = pvals[i].val.d.ar->nmemb;
-			if (perctilesCount) {
-				CHKmalloc(perctiles = calloc(perctilesCount, sizeof(uint32_t)));
-				for (int j = 0; j < pvals[i].val.d.ar->nmemb; ++j) {
-					char *cstr = es_str2cstr(pvals[i].val.d.ar->arr[j], NULL);
-					perctiles[j] = atoi(cstr);
-					free(cstr);
-				}
-			}
-		} else if (!strcmp(modpblk.descr[i].name, PERCTILE_PARAM_WINDOW_SIZE)) {
-			windowSize = pvals[i].val.d.n;
-		}
-		// End percentile POC stuff
-		else {
+		} else {
 			dbgprintf("dyn_stats: program error, non-handled "
-						"param '%s'\n", modpblk.descr[i].name);
+					  "param '%s'\n", modpblk.descr[i].name);
 		}
 	}
 	if (name != NULL) {
-		CHKiRet(dynstats_newBucket(name, resettable, maxCardinality, unusedMetricLife,
-															 percentile_type, perctiles, perctilesCount, windowSize));
+		CHKiRet(dynstats_newBucket(name, resettable, maxCardinality, unusedMetricLife));
 	}
 
 finalize_it:
 	free(name);
-	free(perctiles);
 	cnfparamvalsDestruct(pvals, &modpblk);
 	RETiRet;
 }
@@ -483,10 +423,6 @@ dynstats_initCnf(dynstats_buckets_t *bkts) {
 	CHKiRet(statsobj.ConstructFinalize(bkts->global_stats));
 	pthread_rwlock_init(&bkts->lock, NULL);
 
-	/* perctile elements to be initialized */
-	bkts->listPerctileBuckets = NULL;
-	/* end perctile elements */
-
 	bkts->initialized = 1;
 	
 finalize_it:
@@ -501,11 +437,6 @@ dynstats_destroyAllBuckets(void) {
 	dynstats_buckets_t *bkts;
 	dynstats_bucket_t *b;
 	bkts = &loadConf->dynstats_buckets;
-
-	// destroy perctile buckets here
-	pertile_destroyAllBuckets(bkts);
-	// end
-
 	if (bkts->initialized) {
 		pthread_rwlock_wrlock(&bkts->lock);
 		while(1) {
@@ -693,115 +624,3 @@ finalize_it:
 	RETiRet;
 }
 
-perctile_bucket_t* 
-dynstats_perctile_findBucket(const uchar* name) {
-	perctile_bucket_t *b = NULL;
-
-	dynstats_buckets_t *bkts = &loadConf->dynstats_buckets;
-	if (bkts->initialized) {
-		// TODO: FIX for now use the same lock for both list even though this is unnecesssary
-		pthread_rwlock_rdlock(&bkts->lock);
-		b = perctile_findBucket(bkts->listPerctileBuckets, name);
-		assert(b);
-		pthread_rwlock_unlock(&bkts->lock);
-	} else {
-		LogError(0, RS_RET_INTERNAL_ERROR, "dynstats: bucket lookup failed, as global-initialization "
-		"of buckets was unsuccessful");
-	}
-	return b;
-}
-
-rsRetVal
-dynstats_perctile_obs(perctile_bucket_t *perctile_bkt, uchar* key, int64_t value) {
-	DEFiRet;
-	if (!perctile_bkt) {
-		LogError(0, RS_RET_INTERNAL_ERROR, "dynstats() - perctile bkt not available");
-		FINALIZE;
-	}
-	//printf("dynstats_perctile_obs() - bucket name: %s, key: %s, val: %lld\n", perctile_bkt->name, key, value);
-
-	CHKiRet(perctile_observe(perctile_bkt, key, value));
-
-finalize_it:
-	if (iRet != RS_RET_OK) {
-		// free pstat
-		assert(0);
-	}
-	RETiRet;
-}
-
-rsRetVal
-dynstats_perctileInitNewBucketStats(dynstats_buckets_t *bkts, perctile_bucket_t *b) {
-	DEFiRet;
-	
-	CHKiRet(statsobj.Construct(&b->statsobj));
-	// TODO: determine if this should be renamed.
-	CHKiRet(statsobj.SetOrigin(b->statsobj, UCHAR_CONSTANT("percstats.bucket")));
-	CHKiRet(statsobj.SetName(b->statsobj, b->name));
-	CHKiRet(statsobj.SetReportingNamespace(b->statsobj, UCHAR_CONSTANT("values")));
-	statsobj.SetReadNotifier(b->statsobj, perctile_readCallback, bkts);
-	CHKiRet(statsobj.ConstructFinalize(b->statsobj));
-	
-finalize_it:
-	RETiRet;
-}
-
-void
-dynstats_perctileDestroyPerctileStats(statsobj_t *pobj) {
-	statsobj.Destruct(&pobj);
-}
-
-// Assumes a fully created pstat and bkt, also initiliazes some values in pstat.
-rsRetVal
-dynstats_initAndAddPerctileMetrics(perctile_bucket_t *bkt, perctile_stat_t *pstat) {
-	char stat_name[128];
-	DEFiRet;
-
-	size_t offset = snprintf(stat_name, sizeof(stat_name), "%s_%s_", (char*)bkt->name, (char*)pstat->name);
-	size_t remaining_size = sizeof(stat_name) - offset;
-
-	// initialize the counters array
-	for (size_t i = 0; i < pstat->perctile_ctrs_count; ++i) {
-		uchar perctile_stat_name[128];
-		perctile_ctr_t *ctr = &pstat->ctrs[i];
-
-		// bucket contains the supported percentile values.
-		ctr->percentile = bkt->perctile_values[i];
-		snprintf(stat_name+offset, remaining_size, "p%d", bkt->perctile_values[i]);
-		CHKmalloc(ctr->name = ustrdup(stat_name));
-		// TODO: remove this log
-		LogError(0, 0, "perctile_observe - creating perctile stat counter: %s\n",
-						 perctile_stat_name);
-		CHKiRet(statsobj.AddCounter(bkt->statsobj, (uchar *)ctr->name, ctrType_IntCtr, CTR_FLAG_NONE, &ctr->perctile_stat));
-	}
-
-	strncpy(stat_name+offset, "window_min", remaining_size);
-	CHKiRet(statsobj.AddCounter(bkt->statsobj, (uchar *)stat_name, ctrType_IntCtr, CTR_FLAG_NONE, &pstat->ctrWindowMin));
-
-	strncpy(stat_name+offset, "window_max", remaining_size);
-	CHKiRet(statsobj.AddCounter(bkt->statsobj, (uchar *)stat_name, ctrType_IntCtr, CTR_FLAG_NONE, &pstat->ctrWindowMax));
-
-	strncpy(stat_name+offset, "window_sum", remaining_size);
-	CHKiRet(statsobj.AddCounter(bkt->statsobj, (uchar *)stat_name, ctrType_IntCtr, CTR_FLAG_NONE, &pstat->ctrWindowSum));
-
-	strncpy(stat_name+offset, "window_count", remaining_size);
-	CHKiRet(statsobj.AddCounter(bkt->statsobj, (uchar *)stat_name, ctrType_IntCtr, CTR_FLAG_NONE, &pstat->ctrWindowCount));
-
-
-	// historical counters
-	strncpy(stat_name+offset, "historical_window_min", remaining_size);
-	CHKiRet(statsobj.AddCounter(bkt->statsobj, (uchar *)stat_name, ctrType_IntCtr, CTR_FLAG_NONE, &pstat->ctrHistoricalWindowMin));
-
-	strncpy(stat_name+offset, "historical_window_max", remaining_size);
-	CHKiRet(statsobj.AddCounter(bkt->statsobj, (uchar *)stat_name, ctrType_IntCtr, CTR_FLAG_NONE, &pstat->ctrHistoricalWindowMax));
-
-	strncpy(stat_name+offset, "historical_window_sum", remaining_size);
-	CHKiRet(statsobj.AddCounter(bkt->statsobj, (uchar *)stat_name, ctrType_IntCtr, CTR_FLAG_NONE, &pstat->ctrHistoricalWindowSum));
-
-	strncpy(stat_name+offset, "historical_window_count", remaining_size);
-	CHKiRet(statsobj.AddCounter(bkt->statsobj, (uchar *)stat_name, ctrType_IntCtr, CTR_FLAG_NONE, &pstat->ctrHistoricalWindowCount));
-
-
-finalize_it:
-	RETiRet;
-}

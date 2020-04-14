@@ -14,7 +14,8 @@ template(name="timestamp" type="string" string="%$.ts% %msg%  %$.epochtime% %$.m
 
 # for now, we only check if type is set to something
 #dyn_stats(name="msg_stats")
-dyn_stats(name="msg_stats" type="yes" percentiles=["95", "50"] windowsize="1000" )
+#dyn_stats(name="msg_stats" type="yes" percentiles=["95", "50"] windowsize="1000" )
+perctile_stats(name="msg_stats" percentiles=["95", "50"] windowsize="1000")
 
 # test with a small window
 #set $.msg_prefix = field($msg, 8, 1);
@@ -24,7 +25,7 @@ set $.val = field($msg, 58, 2);
 
 # do a test observe here.
 #set $.status = dyn_perctile_observe("msg_stats", "testkey", 30000000);
-set $.status = dyn_perctile_observe("msg_stats", "testkey", $.val);
+set $.status = perctile_observe("msg_stats", "testkey", $.val);
 
 action(type="omfile" file=`echo $RSYSLOG_OUT_LOG` template="outfmt")
 
@@ -66,4 +67,4 @@ echo doing shutdown
 shutdown_when_empty
 echo wait on shutdown
 wait_shutdown
-#exit_test
+exit_test

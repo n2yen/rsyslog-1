@@ -29,35 +29,6 @@
 #define PERCTILE_PARAM_PERCENTILES "percentiles"
 #define PERCTILE_PARAM_WINDOW_SIZE "windowsize"
 
-/*
- * circ buf macros derived from linux/circ_buf.h
- */
-
-/* Return count in buffer.  */
-#define CIRC_CNT(head,tail,size) (((head) - (tail)) & ((size)-1))
-
-/* Return space available, 0..size-1.  We always leave one free char
-   as a completely full buffer has head == tail, which is the same as
-   empty.  */
-#define CIRC_SPACE(head,tail,size) CIRC_CNT((tail),((head)+1),(size))
-
-/* Return count up to the end of the buffer.  Carefully avoid
-   accessing head and tail more than once, so they can change
-   underneath us without returning inconsistent results.  */
-#define CIRC_CNT_TO_END(head,tail,size) \
-  ({int end = (size) - (tail); \
-    int n = ((head) + end) & ((size)-1); \
-    n < end ? n : end;})
-
-/* Return space available up to the end of the buffer.  */
-#define CIRC_SPACE_TO_END(head,tail,size) \
-  ({int end = (size) - 1 - (head); \
-    int n = (end + (tail)) & ((size)-1); \
-    n <= end ? n : end+1;})
-
-/* Move head by size. */
-#define CIRC_ADD(idx, size, offset)	(((idx) + (offset)) & ((size) - 1))
-
 typedef int64_t ITEM;
 
 struct circ_buf {
@@ -129,14 +100,13 @@ struct perctile_bucket_s {
 // as the container of everything.
 // We can enable this if we create a separate 
 // module
-/*
+
 struct perctile_buckets_s {
 	u_int8_t initialized;
 	statsobj_t *global_stats;
 	pthread_rwlock_t lock;
-	perctile_bucket_t *list;
+	struct perctile_bucket_s *listBuckets;
 };
-*/
 
 // TODO: dynstats, has these typedefs in typedefs.h
 // keep these local for now.
@@ -145,20 +115,22 @@ typedef struct perctile_stat_s perctile_stat_t;
 typedef struct perctile_ctr_s perctile_ctr_t;
 //typedef struct perctile_buckets_s perctile_buckets_t;
 
-// Let's define our interface here
-//rsRetVal perctile_initCnf(perctile_bucket_t *pb);
-rsRetVal perctile_newBucket(dynstats_buckets_t *bkts, const uchar *name, uint8_t *perctiles, uint32_t perctilesCount, uint64_t windowSize);
-void pertile_destroyAllBuckets(dynstats_buckets_t *bkts);
-
 rsRetVal perctile_processCnf(struct cnfobj *cnf);
 rsRetVal perctile_observe(perctile_bucket_t *bkt, uchar* stat_name, int64_t value);
 rsRetVal perctile_publish(void);
 
 // to be determined if needed.
-perctile_bucket_t* perctile_findBucket(perctile_bucket_t *head, const uchar *name);
+//perctile_bucket_t* perctile_findBucket(perctile_bucket_t *head, const uchar *name);
 void perctile_readCallback(statsobj_t __attribute__((unused)) *ignore, void *allbuckets);
 
 // These would only be needed for own module
 rsRetVal perctileClassInit(void);
+
+/* new perctile related functions */
+rsRetVal perctile_initCnf(perctile_buckets_t *b);
+perctile_bucket_t* perctile_findBucket(const uchar* name);
+rsRetVal perctile_obs(perctile_bucket_t *perctile_bkt, uchar* key, int64_t value); 
+rsRetVal perctileInitNewBucketStats(perctile_bucket_t *b);
+rsRetVal initAndAddPerctileMetrics(perctile_bucket_t *bkt, perctile_stat_t *pstat);
 
 #endif /* #ifndef INCLUDED_PERCTILE_STATS_H */

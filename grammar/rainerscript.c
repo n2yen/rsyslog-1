@@ -237,6 +237,9 @@ cnfobjType2str(const enum cnfobjType ot)
 	case CNFOBJ_DYN_STATS:
 		return "dyn_stats";
 		break;
+	case CNFOBJ_PERCTILE_STATS:
+		return "perctile_stats";
+		break;
 	default:return "error: invalid cnfobjType";
 	}
 }
@@ -3402,7 +3405,7 @@ finalize_it:
 }
 
 static rsRetVal
-initFunc_dyn_perctile_obs(struct cnffunc *func)
+initFunc_perctile_obs(struct cnffunc *func)
 {
 	uchar *cstr = NULL;
 	DEFiRet;
@@ -3422,7 +3425,7 @@ initFunc_dyn_perctile_obs(struct cnffunc *func)
 	}
 
 	cstr = (uchar*) es_str2cstr(((struct cnfstringval*) func->expr[0])->estr, NULL);
-	if ( (func->funcdata = dynstats_perctile_findBucket(cstr)) == NULL) {
+	if ( (func->funcdata = perctile_findBucket(cstr)) == NULL) {
 		parser_errmsg("dyn-stats bucket '%s' not found", cstr);
 		FINALIZE;
 	}
@@ -3433,7 +3436,7 @@ finalize_it:
 }
 
 static void ATTR_NONNULL()
-doFunc_dyn_perctile_obs(struct cnffunc *__restrict__ const func,
+doFunc_perctile_obs(struct cnffunc *__restrict__ const func,
 	struct svar *__restrict__ const ret,
 	void *__restrict__ const usrptr,
 	wti_t *__restrict__ const pWti)
@@ -3451,8 +3454,6 @@ doFunc_dyn_perctile_obs(struct cnffunc *__restrict__ const func,
 	cnfexprEval(func->expr[1], &srcVal, usrptr, pWti);
 	cstr = (uchar*) var2CString(&srcVal, &bMustFree);
 
-	//cstr = (uchar*)es_str2cstr(((struct cnfstringval*) func->expr[1])->estr, NULL);
-
 	int success = 0;
 	struct svar srcVal2;
 	long long retVal;
@@ -3466,8 +3467,7 @@ doFunc_dyn_perctile_obs(struct cnffunc *__restrict__ const func,
 		FINALIZE;
 	}
 
-	//parser_errmsg(" NOT AN ERROR: dyn-stats perctile_obs params: %s, %lld", cstr, val);
-	dynstats_perctile_obs(func->funcdata, cstr, val);
+	perctile_obs(func->funcdata, cstr, val);
 
 finalize_it:
 	if (bMustFree) {
@@ -3646,7 +3646,7 @@ static struct scriptFunct functions[] = {
 	{"prifilt", 1, 1, doFunct_Prifilt, initFunc_prifilt, NULL},
 	{"lookup", 2, 2, doFunct_Lookup, resolveLookupTable, NULL},
 	{"dyn_inc", 2, 2, doFunct_DynInc, initFunc_dyn_stats, NULL},
-	{"dyn_perctile_observe", 3, 3, doFunc_dyn_perctile_obs, initFunc_dyn_perctile_obs, NULL},
+	{"perctile_observe", 3, 3, doFunc_perctile_obs, initFunc_perctile_obs, NULL},
 	{"replace", 3, 3, doFunct_Replace, NULL, NULL},
 	{"wrap", 2, 3, doFunct_Wrap, NULL, NULL},
 	{"random", 1, 1, doFunct_RandomGen, NULL, NULL},

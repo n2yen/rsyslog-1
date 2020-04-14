@@ -37,8 +37,35 @@
 #include <stdbool.h>
 #include <math.h>
 
-// support stats gathering
-//DEFobjCurrIf(statsobj)
+/* definitions for objects we access */
+DEFobjStaticHelpers
+DEFobjCurrIf(statsobj)
+
+#define PERCTILE_PARAM_NAME        "name"
+//#define PERCTILE_PARAM_TYPE 			 "type"
+#define PERCTILE_PARAM_PERCENTILES "percentiles"
+#define PERCTILE_PARAM_WINDOW_SIZE "windowsize"
+
+static struct cnfparamdescr modpdescr[] = {
+	{ PERCTILE_PARAM_NAME, eCmdHdlrString, CNFPARAM_REQUIRED },
+	{ PERCTILE_PARAM_PERCENTILES, eCmdHdlrArray, 0},
+	{ PERCTILE_PARAM_WINDOW_SIZE, eCmdHdlrPositiveInt, 0},
+};
+
+static struct cnfparamblk modpblk = {
+  CNFPARAMBLK_VERSION,
+  sizeof(modpdescr)/sizeof(struct cnfparamdescr),
+  modpdescr
+};
+
+rsRetVal
+perctileClassInit(void) {
+  DEFiRet;
+  CHKiRet(objGetObjInterface(&obj));
+  CHKiRet(objUse(statsobj, CORE_COMPONENT));
+finalize_it:
+  RETiRet;
+}
 
 static uint64_t min(uint64_t a, uint64_t b) {
   return a < b ? a : b;
@@ -55,6 +82,35 @@ static uint64_t max(uint64_t a, uint64_t b) {
 #define DEBUG 0
 #endif
 #define PERCTILE_STATS_LOG(...) do { if(DEBUG) fprintf(stderr, __VA_ARGS__); } while(0)
+
+/*
+ * circ buf macros derived from linux/circ_buf.h
+ */
+
+/* Return count in buffer.  */
+#define CIRC_CNT(head,tail,size) (((head) - (tail)) & ((size)-1))
+
+/* Return space available, 0..size-1.  We always leave one free char
+   as a completely full buffer has head == tail, which is the same as
+   empty.  */
+#define CIRC_SPACE(head,tail,size) CIRC_CNT((tail),((head)+1),(size))
+
+/* Return count up to the end of the buffer.  Carefully avoid
+   accessing head and tail more than once, so they can change
+   underneath us without returning inconsistent results.  */
+#define CIRC_CNT_TO_END(head,tail,size) \
+  ({int end = (size) - (tail); \
+    int n = ((head) + end) & ((size)-1); \
+    n < end ? n : end;})
+
+/* Return space available up to the end of the buffer.  */
+#define CIRC_SPACE_TO_END(head,tail,size) \
+  ({int end = (size) - 1 - (head); \
+    int n = (end + (tail)) & ((size)-1); \
+    n <= end ? n : end+1;})
+
+/* Move head by size. */
+#define CIRC_ADD(idx, size, offset)	(((idx) + (offset)) & ((size) - 1))
 
 // simple use of the linux defined circular buffer.
 // TODO: Create a module specific struct outside of this
@@ -127,14 +183,14 @@ int ringbuf_read(ringbuf_t *rb, ITEM *buf, size_t count) {
 }
 
 size_t ringbuf_read_to_end(ringbuf_t *rb, ITEM *buf, size_t count) {
-  size_t bytes = 0;
-  bytes += ringbuf_read(rb, buf, count);
-  if (bytes == 0) {
-    return bytes;
+  size_t nread = 0;
+  nread += ringbuf_read(rb, buf, count);
+  if (nread == 0) {
+    return nread;
   }
   // read the rest if buf circled around
-  bytes += ringbuf_read(rb, buf+bytes, count);
-  return bytes;
+  nread += ringbuf_read(rb, buf+nread, count);
+  return nread;
 }
 
 bool ringbuf_peek(ringbuf_t *rb, ITEM *item) {
@@ -146,9 +202,7 @@ bool ringbuf_peek(ringbuf_t *rb, ITEM *item) {
   return true;
 }
 
-
-// TODO: this is fully implemented yet.
-static void perctile_DestroyPerctileStat(void* p) {
+static void perctileStatDestruct(void* p) {
   if (p) {
     perctile_stat_t *perc_stat = (perctile_stat_t *)p;
     if (perc_stat->name) {
@@ -166,58 +220,40 @@ static void perctile_DestroyPerctileStat(void* p) {
   }
 }
 
-static void perctile_DestroyBucket(perctile_bucket_t *bkt) {
+static void perctileBucketDestruct(perctile_bucket_t *bkt) {
   PERCTILE_STATS_LOG("destructing perctile bucket\n");
   if (bkt) {
+    pthread_rwlock_wrlock(&bkt->lock);
     free(bkt->name);
     free(bkt->perctile_values);
-    // lock
-    pthread_rwlock_wrlock(&bkt->lock);
-    // destrcut statsobj
-    dynstats_perctileDestroyPerctileStats(bkt->statsobj);
-
+	  statsobj.Destruct(&bkt->statsobj);
     hashtable_destroy(bkt->htable, 1); // destroy all perctile stats
     pthread_rwlock_unlock(&bkt->lock);
+    pthread_rwlock_destroy(&bkt->lock);
     free(bkt);
   }
 }
 
-// This needs to actually to set the pointer somewhere. should it return it?
-/*
-static rsRetVal perctile_newPerctileStat(uchar* name, uint32_t *percentiles, uint32_t percentileCount) {
-  pthread_rwlockattr_t attr;
-  DEFiRet;
-  // fill percentile 
-  perctile_stat_t *perc_stat = calloc(1, sizeof(perctile_stat_t));
-
-  perc_stat->name = name;
-  pthread_rwlock_init(&perc_stat->rwlock, &attr);
-
-  // init ringuffer
-
-  RETiRet;
-}
-*/
-
-void pertile_destroyAllBuckets(dynstats_buckets_t *bkts) {
-  perctile_bucket_t *head = bkts->listPerctileBuckets;
+void perctileBucketsDestruct(perctile_buckets_t *bkts) {
+  perctile_bucket_t *head = bkts->listBuckets;
 
 	if (bkts->initialized) {
 		if (head) {
 			perctile_bucket_t *pnode = NULL;
-      pthread_rwlock_trywrlock(&bkts->perctile_lock);
+      pthread_rwlock_trywrlock(&bkts->lock);
 			for (perctile_bucket_t *phead = head; phead != NULL; phead = phead->next) {
 				pnode = phead;
-				perctile_DestroyBucket(pnode);
+				perctileBucketDestruct(pnode);
 			}
 		}
     // destroy any global stats we keep specifically for this.
-    pthread_rwlock_unlock(&bkts->perctile_lock);
-    pthread_rwlock_destroy(&bkts->perctile_lock);
+    pthread_rwlock_unlock(&bkts->lock);
+    pthread_rwlock_destroy(&bkts->lock);
 	}
 }
 
-perctile_bucket_t* perctile_findBucket(perctile_bucket_t *head, const uchar *name) {
+static perctile_bucket_t*
+findBucket(perctile_bucket_t *head, const uchar *name) {
   perctile_bucket_t *pbkt_found = NULL;
   // walk the linked list until the name is found
   pthread_rwlock_rdlock(&head->lock);
@@ -244,11 +280,13 @@ static void print_perctiles(perctile_bucket_t *bkt) {
 }
 
 rsRetVal perctile_observe(perctile_bucket_t *bkt, uchar* key, int64_t value) {
+  uint8_t lock_initialized = 0;
+	uchar* hash_key = NULL;
   DEFiRet;
 
   pthread_rwlock_wrlock(&bkt->lock);
+  lock_initialized = 1;
 	perctile_stat_t *pstat = (perctile_stat_t*) hashtable_search(bkt->htable, key);
-	uchar* hash_key = NULL;
 	if (!pstat) {
 		PERCTILE_STATS_LOG("perctile_observe(): key '%s' not found - creating new pstat", key);
 		// create the pstat if not found
@@ -260,9 +298,7 @@ rsRetVal perctile_observe(perctile_bucket_t *bkt, uchar* key, int64_t value) {
 		pthread_rwlock_init(&pstat->rb_lock, NULL);
 		pthread_rwlock_init(&pstat->stats_lock, NULL);
 
-		// init all stat counters here - TODO: do we need to use this macro since we are essentially using
-    // this as a gauge.
-    // These need to be added at construction time.
+		// init all stat counters here
 		pstat->ctrWindowCount = pstat->ctrWindowMax = pstat->ctrWindowSum = 0;
 		pstat->ctrWindowMin = sizeof(pstat->ctrWindowMin);
     assert(pstat->ctrWindowMin != 0);
@@ -270,19 +306,21 @@ rsRetVal perctile_observe(perctile_bucket_t *bkt, uchar* key, int64_t value) {
 		pstat->ctrHistoricalWindowCount = pstat->ctrHistoricalWindowMax =  pstat->ctrHistoricalWindowSum = 0;
 		pstat->ctrHistoricalWindowMin = sizeof(pstat->ctrHistoricalWindowMin);
 
-		CHKiRet(dynstats_initAndAddPerctileMetrics(bkt, pstat));
+		CHKiRet(initAndAddPerctileMetrics(bkt, pstat));
 		CHKmalloc(hash_key = ustrdup(key));
 		if (!hashtable_insert(bkt->htable, ustrdup(key), pstat)) {
+      perctileStatDestruct(pstat);
 			free(hash_key);
+      pthread_rwlock_unlock(&bkt->lock);
+      iRet = RS_RET_OUT_OF_MEMORY;
+
+      // TODO: remove this
 			assert(0);
       FINALIZE;
 		}
+    pthread_rwlock_unlock(&bkt->lock);
   	PERCTILE_STATS_LOG("perctile_observe - new pstat created - name: %s\n", pstat->name);
   }
-
-	perctile_stat_t *find = (perctile_stat_t*) hashtable_search(bkt->htable, key);
-	assert(find);
-	assert(ustrcmp(find->name, key) == 0);
 
 	// add this value into the ringbuffer
   assert(pstat->rb_observed_stats);
@@ -305,17 +343,15 @@ rsRetVal perctile_observe(perctile_bucket_t *bkt, uchar* key, int64_t value) {
   pstat->ctrHistoricalWindowSum += value;
   pstat->ctrHistoricalWindowMin = min(pstat->ctrHistoricalWindowMin, value);
   pstat->ctrHistoricalWindowMax = max(pstat->ctrHistoricalWindowMax, value);
-  /*
-  PERCTILE_STATS_LOG("perctile_observe - appended value: %lld to ringbuffer\n", value);
-	PERCTILE_STATS_LOG("ringbuffer contents... \n");
-	for (size_t i = 0; i < pstat->rb_observed_stats->size; ++i) {
-		PERCTILE_STATS_LOG("%lld ", pstat->rb_observed_stats->cb.buf[i]);
-	}
-	PERCTILE_STATS_LOG("\n");
-  */
+
+  //PERCTILE_STATS_LOG("perctile_observe - appended value: %lld to ringbuffer\n", value);
+	//PERCTILE_STATS_LOG("ringbuffer contents... \n");
+	//for (size_t i = 0; i < pstat->rb_observed_stats->size; ++i) {
+	//	PERCTILE_STATS_LOG("%lld ", pstat->rb_observed_stats->cb.buf[i]);
+	//}
+	//PERCTILE_STATS_LOG("\n");
 	//print_perctiles(bkt);
 finalize_it:
-  pthread_rwlock_unlock(&bkt->lock);
   if (iRet != RS_RET_OK) {
     // clean up if there was an error
   }
@@ -328,7 +364,6 @@ int cmp(const void* p1, const void* p2) {
 
 static void report_perctile_stats(perctile_bucket_t* pbkt) {
   ITEM *buf = NULL;
-  uint8_t lock_initialized = 0;
   DEFiRet;
 
   pthread_rwlock_rdlock(&pbkt->lock);
@@ -339,13 +374,13 @@ static void report_perctile_stats(perctile_bucket_t* pbkt) {
 			memset(buf, 0, pbkt->window_size*sizeof(ITEM));
 			perctile_stat_t *perc_stat = hashtable_iterator_value(itr);
 			// ringbuffer read
-			size_t bytes = ringbuf_read_to_end(perc_stat->rb_observed_stats, buf, pbkt->window_size);
+			size_t count = ringbuf_read_to_end(perc_stat->rb_observed_stats, buf, pbkt->window_size);
       perc_stat->ctrWindowCount = 0;
-			if (!bytes) {
+			if (!count) {
 				FINALIZE;
 				assert(0);
 			}
-			PERCTILE_STATS_LOG("read %zu bytes\n", bytes);
+			PERCTILE_STATS_LOG("read %zu values\n", count);
 			// calculate the p95 based on the 
 			PERCTILE_STATS_LOG("ringbuffer contents... \n");
 			for (size_t i = 0; i < perc_stat->rb_observed_stats->size; ++i) {
@@ -358,7 +393,7 @@ static void report_perctile_stats(perctile_bucket_t* pbkt) {
 				PERCTILE_STATS_LOG("%lld ", buf[i]);
 			}
 			PERCTILE_STATS_LOG("\n");
-			qsort(buf, bytes, sizeof(ITEM), cmp);
+			qsort(buf, count, sizeof(ITEM), cmp);
 
 			PERCTILE_STATS_LOG("buffer contents after sort... \n");
 			for (size_t i = 0; i < perc_stat->rb_observed_stats->size; ++i) {
@@ -370,7 +405,7 @@ static void report_perctile_stats(perctile_bucket_t* pbkt) {
 			for (size_t i = 0; i < perc_stat->perctile_ctrs_count; ++i) {
 				perctile_ctr_t *pctr = &perc_stat->ctrs[i];
 				// get percentile - this can be cached.
-				int index = ((pctr->percentile/100.0) * bytes)-1;
+				int index = ((pctr->percentile/100.0) * count)-1;
 				// look into if we need to lock this.
 				pctr->perctile_stat = buf[index];
 				PERCTILE_STATS_LOG("report_perctile_stats() - index: %d, perctile stat [%s, %d, %llu]", index, pctr->name, pctr->percentile, pctr->perctile_stat);
@@ -383,104 +418,259 @@ finalize_it:
   free(buf);
 }
 
-void perctile_readCallback(statsobj_t __attribute__((unused)) *ignore, void *allbuckets) {
-  // induce the lock here.
-  dynstats_buckets_t *bkts = (dynstats_buckets_t *)allbuckets;
+void perctile_readCallback(statsobj_t __attribute__((unused)) *ignore, void __attribute__((unused)) *b) {
+  perctile_buckets_t *bkts = &loadConf->perctile_buckets;
 
-  // walk through all buckets and report on the current p95
   pthread_rwlock_rdlock(&bkts->lock);
-  for (perctile_bucket_t *pbkt = bkts->listPerctileBuckets; pbkt != NULL; pbkt = pbkt->next) {
+  for (perctile_bucket_t *pbkt = bkts->listBuckets; pbkt != NULL; pbkt = pbkt->next) {
     report_perctile_stats(pbkt);
   }
   pthread_rwlock_unlock(&bkts->lock);
-
 }
-
-/*
-rsRetVal perctile_initNewBucketStats(dynstats_buckets_t *bkts, perctile_bucket_t *b) {
-	DEFiRet;
-	
-	CHKiRet(statsobj.Construct(&b->statsobj));
-  // TODO: determine if this should be renamed.
-	CHKiRet(statsobj.SetOrigin(b->statsobj, UCHAR_CONSTANT("dynstats.bucket")));
-	CHKiRet(statsobj.SetName(b->statsobj, b->name));
-	CHKiRet(statsobj.SetReportingNamespace(b->statsobj, UCHAR_CONSTANT("values")));
-	statsobj.SetReadNotifier(b->statsobj, perctile_readCallback, bkts);
-	CHKiRet(statsobj.ConstructFinalize(b->stats));
-	
-finalize_it:
-	RETiRet;
-
-}
-*/
 
 /* Create new perctile bucket, and add it to our list of perctile buckets.
 */
-rsRetVal perctile_newBucket(dynstats_buckets_t *bkts, const uchar *name, uint8_t *perctiles,
-                            uint32_t perctilesCount, uint64_t windowSize)
-{
-  uint8_t lock_initialized = 0,
-					metric_count_mutex_initialized = 0;
+static rsRetVal
+perctile_newBucket(const uchar *name, uint8_t *perctiles, uint32_t perctilesCount, uint32_t windowSize) {
+	perctile_buckets_t *bkts;
   perctile_bucket_t* b = NULL;
 	pthread_rwlockattr_t bucket_lock_attr;
   DEFiRet;
 
-  CHKmalloc(b = calloc(1, sizeof(perctile_bucket_t)));
+	bkts = &loadConf->perctile_buckets;
 
-  // initialize
-  // for each percentile, we need to create a
-  pthread_rwlockattr_init(&bucket_lock_attr);
-	lock_initialized = 1;
-#ifdef HAVE_PTHREAD_RWLOCKATTR_SETKIND_NP
-  pthread_rwlockattr_setkind_np(&bucket_lock_attr, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
-#endif  
-  CHKmalloc(b->htable = create_hashtable(7, hash_from_string, key_equals_string, perctile_DestroyPerctileStat));
-	CHKmalloc(b->name = ustrdup(name));
-  b->perctile_values = perctiles;
-	CHKmalloc(b->perctile_values = calloc(perctilesCount, sizeof(u_int8_t)));
-  b->perctile_values_count = perctilesCount;
-	memcpy(b->perctile_values, perctiles, perctilesCount*sizeof(uint8_t));
-  b->window_size = windowSize;
-  b->next = NULL;
-  PERCTILE_STATS_LOG("perctile_newBucket: create new bucket for %s, with windowsize: %d,  values_count: %zu",
-    b->name, b->window_size, b->perctile_values_count);
-
-  // add bucket to list of buckets
-  if (!bkts->listPerctileBuckets) {
-    // none yet
-    bkts->listPerctileBuckets = b;
-    PERCTILE_STATS_LOG("perctile_newBucket: Adding new bucket to empty list ");
-  } else {
-    b->next = bkts->listPerctileBuckets;
-    bkts->listPerctileBuckets = b;
-    PERCTILE_STATS_LOG("perctile_newBucket: prepended new bucket list ");
-  }
-
-  // assert we can find the newly added bucket
+  if (bkts->initialized)
   {
-	  perctile_bucket_t* pb = perctile_findBucket(bkts->listPerctileBuckets, name);
-    assert(pb);
+    CHKmalloc(b = calloc(1, sizeof(perctile_bucket_t)));
+
+    // initialize
+    pthread_rwlock_init(&b->lock, &bucket_lock_attr);
+    CHKmalloc(b->htable = create_hashtable(7, hash_from_string, key_equals_string, perctileStatDestruct));
+    CHKmalloc(b->name = ustrdup(name));
+    b->perctile_values = perctiles;
+    CHKmalloc(b->perctile_values = calloc(perctilesCount, sizeof(u_int8_t)));
+    b->perctile_values_count = perctilesCount;
+    memcpy(b->perctile_values, perctiles, perctilesCount * sizeof(uint8_t));
+    b->window_size = windowSize;
+    b->next = NULL;
+    PERCTILE_STATS_LOG("perctile_newBucket: create new bucket for %s, with windowsize: %d,  values_count: %zu\n",
+                       b->name, b->window_size, b->perctile_values_count);
+
+    // add bucket to list of buckets
+    if (!bkts->listBuckets)
+    {
+      // none yet
+      bkts->listBuckets = b;
+      PERCTILE_STATS_LOG("perctile_newBucket: Adding new bucket to empty list \n");
+    }
+    else
+    {
+      b->next = bkts->listBuckets;
+      bkts->listBuckets = b;
+      PERCTILE_STATS_LOG("perctile_newBucket: prepended new bucket list \n");
+    }
+
+    // assert we can find the newly added bucket
+    {
+      perctile_bucket_t *pb = findBucket(bkts->listBuckets, name);
+      assert(pb);
+    }
+
+    // create the statsobj for this bucket
+    CHKiRet(perctileInitNewBucketStats(b));
   }
-
-  // create the statsobj for this bucket
-	CHKiRet(dynstats_perctileInitNewBucketStats(bkts, b));
-  pthread_rwlock_unlock(&b->lock);
-
+  else
+  {
+    LogError(0, RS_RET_INTERNAL_ERROR, "perctile: bucket creation failed, as "
+		"global-initialization of buckets was unsuccessful");
+		ABORT_FINALIZE(RS_RET_INTERNAL_ERROR);
+  }
 finalize_it:
 	if (iRet != RS_RET_OK)
 	{
-		//if (metric_count_mutex_initialized)
-		//{
+		//if (metric_count_mutex_initialized) {
 		//	pthread_mutex_destroy(&b->mutMetricCount);
 		//}
-		if (lock_initialized)
-		{
-			pthread_rwlock_destroy(&b->lock);
-		}
-		if (b != NULL)
-		{
-			perctile_DestroyBucket(b);
+		if (b != NULL) {
+			perctileBucketDestruct(b);
 		}
 	}
   RETiRet;
+}
+
+// Public functions
+rsRetVal
+perctile_processCnf(struct cnfobj *o) {
+	struct cnfparamvals *pvals;
+	uchar *name = NULL;
+	uint8_t *perctiles = NULL;
+	uint32_t perctilesCount = 0;
+	uint64_t windowSize = 0;
+	DEFiRet;
+
+	pvals = nvlstGetParams(o->nvlst, &modpblk, NULL);
+	if(pvals == NULL) {
+		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
+	}
+	
+	for(short i = 0 ; i < modpblk.nParams ; ++i) {
+		if(!pvals[i].bUsed)
+			continue;
+		if(!strcmp(modpblk.descr[i].name, PERCTILE_PARAM_NAME)) {
+			CHKmalloc(name = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL));
+		} else if (!strcmp(modpblk.descr[i].name, PERCTILE_PARAM_PERCENTILES)) {
+			perctilesCount = pvals[i].val.d.ar->nmemb;
+			if (perctilesCount) {
+				CHKmalloc(perctiles = calloc(perctilesCount, sizeof(uint32_t)));
+				for (int j = 0; j < pvals[i].val.d.ar->nmemb; ++j) {
+					char *cstr = es_str2cstr(pvals[i].val.d.ar->arr[j], NULL);
+					perctiles[j] = atoi(cstr);
+					free(cstr);
+				}
+			}
+		} else if (!strcmp(modpblk.descr[i].name, PERCTILE_PARAM_WINDOW_SIZE)) {
+			windowSize = pvals[i].val.d.n;
+		} else {
+			dbgprintf("perctile: program error, non-handled "
+						"param '%s'\n", modpblk.descr[i].name);
+		}
+	}
+
+	if (name != NULL) {
+		CHKiRet(perctile_newBucket(name, perctiles, perctilesCount, windowSize));
+	}
+
+finalize_it:
+	free(name);
+	free(perctiles);
+	cnfparamvalsDestruct(pvals, &modpblk);
+	RETiRet;
+}
+
+rsRetVal
+perctile_initCnf(perctile_buckets_t *bkts) {
+	DEFiRet;
+
+	bkts->initialized = 0;
+	bkts->listBuckets = NULL;
+	CHKiRet(statsobj.Construct(&bkts->global_stats));
+	CHKiRet(statsobj.SetOrigin(bkts->global_stats, UCHAR_CONSTANT("perctile")));
+	CHKiRet(statsobj.SetName(bkts->global_stats, UCHAR_CONSTANT("global")));
+	CHKiRet(statsobj.SetReportingNamespace(bkts->global_stats, UCHAR_CONSTANT("values")));
+	CHKiRet(statsobj.ConstructFinalize(bkts->global_stats));
+	pthread_rwlock_init(&bkts->lock, NULL);
+	bkts->initialized = 1;
+	
+finalize_it:
+	if (iRet != RS_RET_OK) {
+		statsobj.Destruct(&bkts->global_stats);
+	}
+	RETiRet;
+}
+
+perctile_bucket_t* 
+perctile_findBucket(const uchar* name) {
+	perctile_bucket_t *b = NULL;
+
+	perctile_buckets_t *bkts = &loadConf->perctile_buckets;
+	if (bkts->initialized) {
+		// TODO: FIX for now use the same lock for both list even though this is unnecesssary
+		pthread_rwlock_rdlock(&bkts->lock);
+		b = findBucket(bkts->listBuckets, name);
+		assert(b);
+		pthread_rwlock_unlock(&bkts->lock);
+	} else {
+		LogError(0, RS_RET_INTERNAL_ERROR, "perctile: bucket lookup failed, as global-initialization "
+		"of buckets was unsuccessful");
+	}
+	return b;
+}
+
+rsRetVal
+perctile_obs(perctile_bucket_t *perctile_bkt, uchar* key, int64_t value) {
+	DEFiRet;
+	if (!perctile_bkt) {
+		LogError(0, RS_RET_INTERNAL_ERROR, "perctile() - perctile bkt not available");
+		FINALIZE;
+	}
+	PERCTILE_STATS_LOG("perctile_obs() - bucket name: %s, key: %s, val: %lld\n", perctile_bkt->name, key, value);
+
+	CHKiRet(perctile_observe(perctile_bkt, key, value));
+
+finalize_it:
+	if (iRet != RS_RET_OK) {
+		// free pstat
+		assert(0);
+	}
+	RETiRet;
+}
+
+rsRetVal
+perctileInitNewBucketStats(perctile_bucket_t *b) {
+	DEFiRet;
+	
+	CHKiRet(statsobj.Construct(&b->statsobj));
+	// TODO: determine if this should be renamed.
+	CHKiRet(statsobj.SetOrigin(b->statsobj, UCHAR_CONSTANT("percstats.bucket")));
+	CHKiRet(statsobj.SetName(b->statsobj, b->name));
+	CHKiRet(statsobj.SetReportingNamespace(b->statsobj, UCHAR_CONSTANT("values")));
+	statsobj.SetReadNotifier(b->statsobj, perctile_readCallback, b);
+	CHKiRet(statsobj.ConstructFinalize(b->statsobj));
+	
+finalize_it:
+	RETiRet;
+}
+
+// Assumes a fully created pstat and bkt, also initiliazes some values in pstat.
+rsRetVal
+initAndAddPerctileMetrics(perctile_bucket_t *bkt, perctile_stat_t *pstat) {
+	char stat_name[128];
+	DEFiRet;
+
+	size_t offset = snprintf(stat_name, sizeof(stat_name), "%s_%s_", (char*)bkt->name, (char*)pstat->name);
+	size_t remaining_size = sizeof(stat_name) - offset;
+
+	// initialize the counters array
+	for (size_t i = 0; i < pstat->perctile_ctrs_count; ++i) {
+		perctile_ctr_t *ctr = &pstat->ctrs[i];
+
+		// bucket contains the supported percentile values.
+		ctr->percentile = bkt->perctile_values[i];
+		snprintf(stat_name+offset, remaining_size, "p%d", bkt->perctile_values[i]);
+		CHKmalloc(ctr->name = ustrdup(stat_name));
+
+    PERCTILE_STATS_LOG("perctile_observe - creating perctile stat counter: %s\n",
+						 ctr->name);
+		CHKiRet(statsobj.AddCounter(bkt->statsobj, (uchar *)ctr->name, ctrType_IntCtr, CTR_FLAG_NONE, &ctr->perctile_stat));
+	}
+
+	strncpy(stat_name+offset, "window_min", remaining_size);
+	CHKiRet(statsobj.AddCounter(bkt->statsobj, (uchar *)stat_name, ctrType_IntCtr, CTR_FLAG_NONE, &pstat->ctrWindowMin));
+
+	strncpy(stat_name+offset, "window_max", remaining_size);
+	CHKiRet(statsobj.AddCounter(bkt->statsobj, (uchar *)stat_name, ctrType_IntCtr, CTR_FLAG_NONE, &pstat->ctrWindowMax));
+
+	strncpy(stat_name+offset, "window_sum", remaining_size);
+	CHKiRet(statsobj.AddCounter(bkt->statsobj, (uchar *)stat_name, ctrType_IntCtr, CTR_FLAG_NONE, &pstat->ctrWindowSum));
+
+	strncpy(stat_name+offset, "window_count", remaining_size);
+	CHKiRet(statsobj.AddCounter(bkt->statsobj, (uchar *)stat_name, ctrType_IntCtr, CTR_FLAG_NONE, &pstat->ctrWindowCount));
+
+
+	// historical counters
+	strncpy(stat_name+offset, "historical_window_min", remaining_size);
+	CHKiRet(statsobj.AddCounter(bkt->statsobj, (uchar *)stat_name, ctrType_IntCtr, CTR_FLAG_NONE, &pstat->ctrHistoricalWindowMin));
+
+	strncpy(stat_name+offset, "historical_window_max", remaining_size);
+	CHKiRet(statsobj.AddCounter(bkt->statsobj, (uchar *)stat_name, ctrType_IntCtr, CTR_FLAG_NONE, &pstat->ctrHistoricalWindowMax));
+
+	strncpy(stat_name+offset, "historical_window_sum", remaining_size);
+	CHKiRet(statsobj.AddCounter(bkt->statsobj, (uchar *)stat_name, ctrType_IntCtr, CTR_FLAG_NONE, &pstat->ctrHistoricalWindowSum));
+
+	strncpy(stat_name+offset, "historical_window_count", remaining_size);
+	CHKiRet(statsobj.AddCounter(bkt->statsobj, (uchar *)stat_name, ctrType_IntCtr, CTR_FLAG_NONE, &pstat->ctrHistoricalWindowCount));
+
+
+finalize_it:
+	RETiRet;
 }
