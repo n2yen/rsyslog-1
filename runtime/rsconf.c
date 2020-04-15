@@ -237,6 +237,7 @@ CODESTARTobjDestruct(rsconf)
 	freeCnf(pThis);
 	tplDeleteAll(pThis);
 	dynstats_destroyAllBuckets();
+	perctileBucketsDestruct();
 	free(pThis->globals.mainQ.pszMainMsgQFName);
 	free(pThis->globals.pszConfDAGFile);
 	lookupDestroyCnf();

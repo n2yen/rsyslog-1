@@ -13,7 +13,6 @@ template(name="outfmt" type="string" string="%$.timestamp% %msg%  val=%$.val%\n"
 template(name="timestamp" type="string" string="%$.ts% %msg%  %$.epochtime% %$.millis% %$.cur_epoch% %$.delta_secs% %$.delta_millis%\n")
 
 # for now, we only check if type is set to something
-#dyn_stats(name="msg_stats")
 #dyn_stats(name="msg_stats" type="yes" percentiles=["95", "50"] windowsize="1000" )
 perctile_stats(name="msg_stats" percentiles=["95", "50"] windowsize="1000")
 
@@ -52,7 +51,7 @@ rst_msleep 1100 # wait for stats flush
 #custom_content_check 'msg_stats_testkey_p50=500' "${RSYSLOG_DYNNAME}.out.stats.log"
 
 injectmsg 1001 1000
-#wait_for_stats_flush ${RSYSLOG_DYNNAME}.out.stats.log
+wait_for_stats_flush ${RSYSLOG_DYNNAME}.out.stats.log
 wait_queueempty
 rst_msleep 1100 # wait for stats flush
 wait_for_stats_flush ${RSYSLOG_DYNNAME}.out.stats.log

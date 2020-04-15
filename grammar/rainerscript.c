@@ -3467,7 +3467,7 @@ doFunc_perctile_obs(struct cnffunc *__restrict__ const func,
 		FINALIZE;
 	}
 
-	perctile_obs(func->funcdata, cstr, val);
+	retVal = perctile_obs(func->funcdata, cstr, val);
 
 finalize_it:
 	if (bMustFree) {
@@ -3475,7 +3475,7 @@ finalize_it:
 	}
 	varFreeMembers(&srcVal);
 	varFreeMembers(&srcVal2);
-	ret->d.n = 0;
+	ret->d.n = retVal;
 	ret->datatype = 'N';
 }
 
