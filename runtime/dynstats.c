@@ -30,24 +30,28 @@
 #include "srUtils.h"
 #include "errmsg.h"
 #include "rsconf.h"
+#include "datetime.h"
 #include "unicode-helper.h"
 #include "hashtable_itr.h"
 
 /* definitions for objects we access */
 DEFobjStaticHelpers
 DEFobjCurrIf(statsobj)
+DEFobjCurrIf(datetime)
 
 #define DYNSTATS_PARAM_NAME "name"
 #define DYNSTATS_PARAM_RESETTABLE "resettable"
 #define DYNSTATS_PARAM_MAX_CARDINALITY "maxCardinality"
 #define DYNSTATS_PARAM_UNUSED_METRIC_LIFE "unusedMetricLife" /* in seconds */
 #define DYNSTATS_PARAM_PERSISTSTATEINTERVAL "persistStateInterval"
+#define DYNSTATS_PARAM_PERSISTSTATE_TIME_INTERVAL "persistStateTimeInterval"
 #define DYNSTATS_PARAM_STATEFILE_DIRECTORY "statefile.directory"
 
 #define DYNSTATS_DEFAULT_RESETTABILITY 1
 #define DYNSTATS_DEFAULT_MAX_CARDINALITY 2000
 #define DYNSTATS_DEFAULT_UNUSED_METRIC_LIFE 3600 /* seconds */
 #define DYNSTATS_DEFAULT_PERSISTSTATEINTERVAL 0  /* seconds, default is 0, or never */
+#define DYNSTATS_DEFAULT_PERSISTSTATE_TIME_INTERVAL 0  /* seconds, default is 0, or never */
 
 #define DYNSTATS_MAX_BUCKET_NS_METRIC_LENGTH 100
 #define DYNSTATS_METRIC_NAME_SEPARATOR '.'
@@ -61,6 +65,7 @@ static struct cnfparamdescr modpdescr[] = {
 	{ DYNSTATS_PARAM_MAX_CARDINALITY, eCmdHdlrPositiveInt, 0},
 	{ DYNSTATS_PARAM_UNUSED_METRIC_LIFE, eCmdHdlrPositiveInt, 0}, /* in minutes */
 	{ DYNSTATS_PARAM_PERSISTSTATEINTERVAL, eCmdHdlrPositiveInt, 0 },
+	{ DYNSTATS_PARAM_PERSISTSTATE_TIME_INTERVAL, eCmdHdlrPositiveInt, 0 },
 	{ DYNSTATS_PARAM_STATEFILE_DIRECTORY, eCmdHdlrString, 0 }
 };
 
@@ -83,6 +88,7 @@ dynstatsClassInit(void) {
 	DEFiRet;
 	CHKiRet(objGetObjInterface(&obj));
 	CHKiRet(objUse(statsobj, CORE_COMPONENT));
+	CHKiRet(objUse(datetime, CORE_COMPONENT));
 finalize_it:
 	RETiRet;
 }
@@ -121,7 +127,7 @@ dynstats_destroyBucket(dynstats_bucket_t* b) {
 
 	bkts = &loadConf->dynstats_buckets;
 
-	if(b->persistStateInterval) {
+	if(b->persist_state_interval) {
 		persistBucketState(b);
 	}
 	pthread_rwlock_wrlock(&b->lock);
@@ -129,7 +135,7 @@ dynstats_destroyBucket(dynstats_bucket_t* b) {
 	dynstats_destroyCountersIn(b, b->survivor_table, b->survivor_ctrs);
 	statsobj.Destruct(&b->stats);
 	free(b->name);
-	free(b->stateFileDirectory);
+	free(b->state_file_directory);
 	pthread_rwlock_unlock(&b->lock);
 	pthread_rwlock_destroy(&b->lock);
 	pthread_mutex_destroy(&b->mutMetricCount);
@@ -334,22 +340,22 @@ static rsRetVal ATTR_NONNULL(1) openFileWithStateFile(dynstats_bucket_t *b) {
 	DEFiRet;
 	struct stat stat_buf;
 	uchar statefile[MAXFNAME];
-	uchar statefname[MAXFNAME];
+	uchar state_file_path[MAXFNAME];
 
-	uchar *const statefn = getStateFileName(b, statefile, sizeof(statefile));
-	assert(statefn);
+	uchar *const state_file_name = getStateFileName(b, statefile, sizeof(statefile));
+	assert(state_file_name);
 	/* Get full path and file name */
-	getFullStateFileName(b, statefn, statefname, sizeof(statefname));
-	DBGPRINTF("opening statefile for '%s', state file '%s'\n", b->name, statefname);
+	getFullStateFileName(b, state_file_name, state_file_path, sizeof(state_file_path));
+	DBGPRINTF("opening statefile for '%s', state file '%s'\n", b->name, state_file_path);
 
 	/* check if the file exists */
-	if(stat((char*) statefname, &stat_buf) == -1) {
+	if(stat((char*) state_file_path, &stat_buf) == -1) {
 		LogMsg(0, RS_RET_FILE_NOT_FOUND, LOG_INFO,
-				"dyn_stats: warning state file doesn't exist: '%s'", statefname);
+				"dyn_stats: warning state file doesn't exist: '%s'", state_file_path);
 		FINALIZE;
 	}
 
-	json_object *json_obj = fjson_object_from_file((const char*)statefname);
+	json_object *json_obj = fjson_object_from_file((const char*)state_file_path);
 	if (!json_obj) {
 		LogMsg(0, RS_RET_JSON_UNUSABLE, LOG_INFO,
 				"dyn_stats: error couldn't read json from file.");
@@ -390,7 +396,7 @@ finalize_it:
 
 static rsRetVal
 dynstats_newBucket(const uchar* name, uint8_t resettable, uint32_t maxCardinality, uint32_t unusedMetricLife,
-		uint32_t persistStateInterval, const uchar *stateFileDirectory) {
+		uint32_t persistStateInterval, uint32_t persistStateTimeInterval, const uchar *stateFileDirectory) {
 	dynstats_bucket_t *b;
 	dynstats_buckets_t *bkts;
 	uint8_t lock_initialized, metric_count_mutex_initialized;
@@ -407,11 +413,12 @@ dynstats_newBucket(const uchar* name, uint8_t resettable, uint32_t maxCardinalit
 		b->resettable = resettable;
 		b->maxCardinality = maxCardinality;
 		b->unusedMetricLife = 1000 * unusedMetricLife;
-		b->persistStateInterval = persistStateInterval;
-		b->nUpdates = 0;
+		b->persist_state_interval = persistStateInterval;
+		b->persist_state_time_interval = persistStateTimeInterval;
+		b->n_updates = 0;
 		CHKmalloc(b->name = ustrdup(name));
 		if (stateFileDirectory) {
-			CHKmalloc(b->stateFileDirectory = ustrdup(stateFileDirectory));
+			CHKmalloc(b->state_file_directory = ustrdup(stateFileDirectory));
 		}
 
 		pthread_rwlockattr_init(&bucket_lock_attr);
@@ -429,6 +436,13 @@ dynstats_newBucket(const uchar* name, uint8_t resettable, uint32_t maxCardinalit
 		CHKiRet(dynstats_resetBucket(b));
 
 		CHKiRet(dynstats_addBucketMetrics(bkts, b, name));
+
+		if (b && (b->persist_state_interval || b->persist_state_time_interval)) {
+			time_t now;
+			dynstats_openStateFile(b);
+			datetime.GetTime(&now);
+			b->persist_expiration_time = now + persistStateTimeInterval;
+		}
 
 		pthread_rwlock_wrlock(&bkts->lock);
 		if (bkts->list == NULL) {
@@ -468,6 +482,7 @@ dynstats_processCnf(struct cnfobj *o) {
 	uint32_t maxCardinality = DYNSTATS_DEFAULT_MAX_CARDINALITY;
 	uint32_t unusedMetricLife = DYNSTATS_DEFAULT_UNUSED_METRIC_LIFE;
 	uint32_t persistStateInterval = DYNSTATS_DEFAULT_PERSISTSTATEINTERVAL;
+	uint32_t persistStateTimeInterval = DYNSTATS_DEFAULT_PERSISTSTATE_TIME_INTERVAL;
 	DEFiRet;
 
 	pvals = nvlstGetParams(o->nvlst, &modpblk, NULL);
@@ -488,6 +503,8 @@ dynstats_processCnf(struct cnfobj *o) {
 			unusedMetricLife = (uint32_t) pvals[i].val.d.n;
 		} else if (!strcmp(modpblk.descr[i].name, DYNSTATS_PARAM_PERSISTSTATEINTERVAL)) {
 			persistStateInterval = (uint32_t) pvals[i].val.d.n;
+		} else if (!strcmp(modpblk.descr[i].name, DYNSTATS_PARAM_PERSISTSTATE_TIME_INTERVAL)) {
+			persistStateTimeInterval = (uint32_t) pvals[i].val.d.n;
 		} else if (!strcmp(modpblk.descr[i].name, DYNSTATS_PARAM_STATEFILE_DIRECTORY)) {
 			CHKmalloc(stateFileDirectory = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL));
 		} else {
@@ -497,7 +514,7 @@ dynstats_processCnf(struct cnfobj *o) {
 	}
 	if (name != NULL) {
 		CHKiRet(dynstats_newBucket(name, resettable, maxCardinality, unusedMetricLife,
-					persistStateInterval, stateFileDirectory));
+					persistStateInterval, persistStateTimeInterval, stateFileDirectory));
 	}
 
 finalize_it:
@@ -566,10 +583,6 @@ dynstats_findBucket(const uchar* name) {
 			}
 			b = b->next;
 		}
-
-		if (b && b->persistStateInterval) {
-			dynstats_openStateFile(b);
-		}
 		pthread_rwlock_unlock(&bkts->lock);
 	} else {
 		b = NULL;
@@ -609,13 +622,13 @@ finalize_it:
  *	Helper function adapted from imfile of the same name - possible candidate for refactor.
  */
 static rsRetVal ATTR_NONNULL()
-atomicWriteStateFile(const char *fn, const char *content) {
+writeStateFile(const char *file_name, const char *content) {
 	DEFiRet;
-	const int fd = open(fn, O_CLOEXEC | O_NOCTTY | O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	const int fd = open(file_name, O_CLOEXEC | O_NOCTTY | O_WRONLY | O_CREAT | O_TRUNC, 0600);
 	if(fd < 0) {
 		LogError(errno, RS_RET_IO_ERROR, "dynstats: cannot open state file '%s' for "
 			"persisting file state - some data will probably be duplicated "
-			"on next startup", fn);
+			"on next startup", file_name);
 		ABORT_FINALIZE(RS_RET_IO_ERROR);
 	}
 
@@ -624,8 +637,8 @@ atomicWriteStateFile(const char *fn, const char *content) {
 	if(w != (ssize_t) toWrite) {
 		LogError(errno, RS_RET_IO_ERROR, "dynstats: partial write to state file '%s' "
 			"this may cause trouble in the future. We will try to delete the "
-			"state file, as this provides most consistent state", fn);
-		unlink(fn);
+			"state file, as this provides most consistent state", file_name);
+		unlink(file_name);
 		ABORT_FINALIZE(RS_RET_IO_ERROR);
 	}
 
@@ -641,10 +654,10 @@ getStateFileDir(dynstats_bucket_t *b)
 {
 	const uchar *wrkdir;
 	assert(b != NULL);
-	if (b->stateFileDirectory == NULL) {
+	if (b->state_file_directory == NULL) {
 		wrkdir = glblGetWorkDirRaw();
 	} else {
-		wrkdir = b->stateFileDirectory;
+		wrkdir = b->state_file_directory;
 	}
 	return(wrkdir);
 }
@@ -712,7 +725,6 @@ persistBucketState(dynstats_bucket_t *b) {
 	CHKmalloc(json_bucket_values = json_object_new_object());
 	json_object_object_add(json, DYNSTATS_BUCKET_PERSIST_VALUES_NAME, json_bucket_values);
 
-	pthread_rwlock_rdlock(&b->lock);
 	if (hashtable_count(b->table) > 0) {
 		struct hashtable_itr *itr = hashtable_iterator(b->table);
 		dynstats_ctr_t *pctr = NULL;
@@ -723,10 +735,9 @@ persistBucketState(dynstats_bucket_t *b) {
 		} while (hashtable_iterator_advance(itr));
 		free(itr);
 	}
-	pthread_rwlock_unlock(&b->lock);
 
-	const char *jstr =  json_object_to_json_string_ext(json, JSON_C_TO_STRING_SPACED);
-	CHKiRet(atomicWriteStateFile((const char*)statefname, jstr));
+	const char *jstr =  json_object_to_json_string_ext(json, JSON_C_TO_STRING_PLAIN);
+	CHKiRet(writeStateFile((const char*)statefname, jstr));
 
 finalize_it:
 	if(iRet != RS_RET_OK) {
@@ -801,7 +812,7 @@ dynstats_addNewCtr(dynstats_bucket_t *b, const uchar* metric, uint8_t doInitialI
 			}
 			if (doInitialOffset) {
 				// doInitialOffset regardless of the state of GatherStats
-				ATOMIC_ADD_uint64(&effective_ctr->ctr, &effective_ctr->mutCtr, doInitialOffset);
+				effective_ctr->ctr += doInitialOffset;
 			}
 		}
 	}
@@ -828,6 +839,18 @@ finalize_it:
 #if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC diagnostic pop
 #endif
+
+static sbool dynstats_shouldPersist(dynstats_bucket_t *b, time_t now) {
+	sbool shouldPersist = FALSE;
+	pthread_rwlock_rdlock(&b->lock);
+	if( (b->persist_state_interval > 0 && ++b->n_updates >= b->persist_state_interval) ||
+			(b->persist_expiration_time && now >= b->persist_expiration_time) )
+	{
+		shouldPersist = TRUE;
+	}
+	pthread_rwlock_unlock(&b->lock);
+	return shouldPersist;
+}
 
 rsRetVal
 dynstats_inc(dynstats_bucket_t *b, uchar* metric) {
@@ -856,6 +879,20 @@ dynstats_inc(dynstats_bucket_t *b, uchar* metric) {
 	if (ctr == NULL) {
 		CHKiRet(dynstats_addNewCtr(b, metric, 1, 0));
 	}
+
+	time_t now;
+	datetime.GetTime(&now);
+	if (dynstats_shouldPersist(b, now)) {
+		/* TODO: suggested to be refactored into bg thread */
+		persistBucketState(b);
+		if (b->persist_state_interval) {
+			b->n_updates = 0;
+		}
+		if (b->persist_state_time_interval) {
+			b->persist_expiration_time = now + b->persist_state_time_interval;
+		}
+	}
+
 finalize_it:
 	if (iRet != RS_RET_OK) {
 		if (iRet == RS_RET_NOENTRY) {
@@ -865,11 +902,6 @@ finalize_it:
 		} else {
 			STATSCOUNTER_INC(b->ctrOpsOverflow, b->mutCtrOpsOverflow);
 		}
-	}
-
-	if(b->persistStateInterval > 0 && ++b->nUpdates >= b->persistStateInterval) {
-		persistBucketState(b);
-		b->nUpdates = 0;
 	}
 	RETiRet;
 }

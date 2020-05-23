@@ -63,9 +63,11 @@ struct dynstats_bucket_s {
 	uint32_t lastResetTs;
 	struct timespec metricCleanupTimeout;
 	uint8_t resettable;
-	uchar *stateFileDirectory;
-	uint32_t persistStateInterval;
-	uint32_t nUpdates; /* number of bucket updates before persisting the stream */
+	uchar *state_file_directory;
+	uint32_t persist_state_interval;
+	uint32_t persist_state_time_interval;
+	time_t persist_expiration_time;
+	uint32_t n_updates; /* number of bucket updates before persisting the stream */
 };
 
 struct dynstats_buckets_s {
