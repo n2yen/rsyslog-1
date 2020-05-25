@@ -3419,14 +3419,14 @@ initFunc_perctile_obs(struct cnffunc *func)
 
 	func->funcdata = NULL;
 	if (func->expr[0]->nodetype != 'S') {
-		parser_errmsg("dyn-stats bucket-name (param 1) of dyn-stats manipulating "
-		"functions like dyn_perctile_obs must be a constant string");
+		parser_errmsg("perctile-stats bucket-name (param 1) of perctile-stats manipulating "
+		"functions like perctile_observe must be a constant string");
 		FINALIZE;
 	}
 
 	cstr = (uchar*) es_str2cstr(((struct cnfstringval*) func->expr[0])->estr, NULL);
 	if ( (func->funcdata = perctile_findBucket(cstr)) == NULL) {
-		parser_errmsg("dyn-stats bucket '%s' not found", cstr);
+		parser_errmsg("perctile-stats bucket '%s' not found", cstr);
 		FINALIZE;
 	}
 
