@@ -1,5 +1,7 @@
 #!/bin/bash
 # This file is part of the rsyslog project, released under ASL 2.0
+
+#export RSYSLOG_DEBUG="Debug"
 . ${srcdir:=.}/diag.sh init
 generate_conf
 add_conf '

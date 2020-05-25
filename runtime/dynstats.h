@@ -48,6 +48,12 @@ struct dynstats_bucket_s {
 	ctr_t *pOpsIgnoredCtr;
 	STATSCOUNTER_DEF(ctrPurgeTriggered, mutCtrPurgeTriggered);
 	ctr_t *pPurgeTriggeredCtr;
+
+	/* file writer thread updates these counters - currently takes the bucket lock */
+	intctr_t flushedBytes;
+	intctr_t flushedCount;
+	intctr_t flushedErrors;
+
 	struct dynstats_bucket_s *next; /* linked list ptr */
 	struct dynstats_ctr_s *ctrs;
 	/*survivor objects are used to keep counter values around for upto unused-ttl duration,

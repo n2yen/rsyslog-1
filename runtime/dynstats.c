@@ -33,6 +33,7 @@
 #include "datetime.h"
 #include "unicode-helper.h"
 #include "hashtable_itr.h"
+#include <sys/queue.h>
 
 /* definitions for objects we access */
 DEFobjStaticHelpers
@@ -82,6 +83,11 @@ static int getFullStateFileName(dynstats_bucket_t *b, uchar* pszstatefile, uchar
 static uchar* getStateFileName(const dynstats_bucket_t *const pbucket,
 		uchar *const __restrict__ buf, const size_t lenbuf) ATTR_NONNULL(1, 2);
 static rsRetVal persistBucketState(dynstats_bucket_t *b) ATTR_NONNULL(1);
+static rsRetVal initFileWriteWorker(void);
+static rsRetVal enqueueFileWriteTask(dynstats_bucket_t *b, const char* file_name, const char* content);
+static void startFileWriteWorker(void);
+static void stopFileWriteWorker(void);
+static void destroyFileWriteWorker(void);
 
 rsRetVal
 dynstatsClassInit(void) {
@@ -89,6 +95,10 @@ dynstatsClassInit(void) {
 	CHKiRet(objGetObjInterface(&obj));
 	CHKiRet(objUse(statsobj, CORE_COMPONENT));
 	CHKiRet(objUse(datetime, CORE_COMPONENT));
+	/* TODO: consider if this should be moved to post configuration */
+	initFileWriteWorker();
+	startFileWriteWorker();
+
 finalize_it:
 	RETiRet;
 }
@@ -326,6 +336,21 @@ dynstats_initNewBucketStats(dynstats_bucket_t *b) {
 	CHKiRet(statsobj.SetOrigin(b->stats, UCHAR_CONSTANT("dynstats.bucket")));
 	CHKiRet(statsobj.SetName(b->stats, b->name));
 	CHKiRet(statsobj.SetReportingNamespace(b->stats, UCHAR_CONSTANT("values")));
+
+	char bucket_stat_name[256];
+	size_t bufsize = sizeof(bucket_stat_name);
+	snprintf(bucket_stat_name, bufsize, "%s_%s", b->name, "flushed_bytes");
+	CHKiRet(statsobj.AddCounter(b->stats, (uchar*)bucket_stat_name,
+		ctrType_Int, CTR_FLAG_NONE, &b->flushedBytes));
+
+	snprintf(bucket_stat_name, bufsize, "%s_%s", b->name, "flushed_counts");
+	CHKiRet(statsobj.AddCounter(b->stats, (uchar*)bucket_stat_name,
+		ctrType_Int, CTR_FLAG_NONE, &b->flushedCount));
+
+	snprintf(bucket_stat_name, bufsize, "%s_%s", b->name, "flush_errors");
+	CHKiRet(statsobj.AddCounter(b->stats, (uchar*)bucket_stat_name,
+		ctrType_Int, CTR_FLAG_NONE, &b->flushedErrors));
+
 	statsobj.SetReadNotifier(b->stats, dynstats_readCallback, b);
 	CHKiRet(statsobj.ConstructFinalize(b->stats));
 
@@ -567,6 +592,10 @@ dynstats_destroyAllBuckets(void) {
 		pthread_rwlock_unlock(&bkts->lock);
 		pthread_rwlock_destroy(&bkts->lock);
 	}
+
+	/* TODO: destroy bg-thread here for now, move this into an class exit place */
+	stopFileWriteWorker();
+	destroyFileWriteWorker();
 }
 
 dynstats_bucket_t *
@@ -622,7 +651,9 @@ finalize_it:
  *	Helper function adapted from imfile of the same name - possible candidate for refactor.
  */
 static rsRetVal ATTR_NONNULL()
-writeStateFile(const char *file_name, const char *content) {
+writeStateFile(dynstats_bucket_t *b, const char *file_name, const char *content) {
+	const size_t toWrite = strlen(content);
+	ssize_t w = 0;
 	DEFiRet;
 	const int fd = open(file_name, O_CLOEXEC | O_NOCTTY | O_WRONLY | O_CREAT | O_TRUNC, 0600);
 	if(fd < 0) {
@@ -632,8 +663,7 @@ writeStateFile(const char *file_name, const char *content) {
 		ABORT_FINALIZE(RS_RET_IO_ERROR);
 	}
 
-	const size_t toWrite = strlen(content);
-	const ssize_t w = write(fd, content, toWrite);
+	w = write(fd, content, toWrite);
 	if(w != (ssize_t) toWrite) {
 		LogError(errno, RS_RET_IO_ERROR, "dynstats: partial write to state file '%s' "
 			"this may cause trouble in the future. We will try to delete the "
@@ -643,6 +673,17 @@ writeStateFile(const char *file_name, const char *content) {
 	}
 
 finalize_it:
+	/* TODO: revisit - seems wasteful to use the bucket lock for this */
+	pthread_rwlock_wrlock(&b->lock);
+	if (iRet == RS_RET_IO_ERROR) {
+		b->flushedErrors++;
+	}
+	if (w != -1) {
+		b->flushedBytes += w;
+		b->flushedCount++;
+	}
+	pthread_rwlock_unlock(&b->lock);
+
 	if(fd >= 0) {
 		close(fd);
 	}
@@ -737,7 +778,7 @@ persistBucketState(dynstats_bucket_t *b) {
 	}
 
 	const char *jstr =  json_object_to_json_string_ext(json, JSON_C_TO_STRING_PLAIN);
-	CHKiRet(writeStateFile((const char*)statefname, jstr));
+	CHKiRet(enqueueFileWriteTask(b, (const char*)statefname, jstr));
 
 finalize_it:
 	if(iRet != RS_RET_OK) {
@@ -906,3 +947,165 @@ finalize_it:
 	RETiRet;
 }
 
+static struct wrkrInfo_s {
+	pthread_t tid;	/* the worker's thread ID */
+} wrkrInfo;
+
+typedef struct file_write_entry_s {
+	STAILQ_ENTRY(file_write_entry_s) link;
+	const char* name;
+	const char* content;
+	dynstats_bucket_t *bucket;
+} file_write_entry_t;
+
+typedef struct file_write_queue_s {
+	STAILQ_HEAD(head, file_write_entry_s) q;
+	STATSCOUNTER_DEF(ctrEnq, mutCtrEnq);
+	int size;
+	int ctrMaxSz;
+	statsobj_t *stats;
+	pthread_mutex_t mut;
+	pthread_cond_t wakeup_worker;
+} file_write_queue_t;
+
+static file_write_queue_t work_q;
+static int wrkrRunning;
+
+
+static void
+processWorkItem(file_write_entry_t *task) {
+	// write out the file
+	DBGPRINTF("dynstats: worker processing - '%s', '%s'\n", task->name, task->content);
+	writeStateFile(task->bucket, task->name, task->content);
+}
+
+static void *
+fileWriteWorker(void* data) {
+	struct wrkrInfo_s *me = (struct wrkrInfo_s*) data;
+	pthread_mutex_lock(&work_q.mut);
+	++wrkrRunning;
+	pthread_mutex_unlock(&work_q.mut);
+
+	file_write_entry_t *task;
+	while(1) {
+		task = NULL;
+		pthread_mutex_lock(&work_q.mut);
+		if (work_q.size == 0) {
+			--wrkrRunning;
+			//if (glbl.GetGlobalInputTermState() != 0) {
+			// TODO: clean this up
+			if(ATOMIC_FETCH_32BIT(&bTerminateInputs, &mutTerminateInputs) != 0) {
+				pthread_mutex_unlock(&work_q.mut);
+				break;
+			} else {
+				DBGPRINTF("dynstats: worker %llu waiting on new work items\n",
+					(unsigned long long) me->tid);
+				pthread_cond_wait(&work_q.wakeup_worker, &work_q.mut);
+				DBGPRINTF("dynstats: worker %llu awoken\n", (unsigned long long) me->tid);
+			}
+			++wrkrRunning;
+		}
+		if (work_q.size> 0) {
+			task = STAILQ_FIRST(&work_q.q);
+			STAILQ_REMOVE_HEAD(&work_q.q, link);
+			work_q.size--;
+		}
+		pthread_mutex_unlock(&work_q.mut);
+
+		if (task != NULL) {
+			processWorkItem(task);
+			free((void*)task->name);
+			free((void*)task->content);
+			free(task);
+		}
+	}
+	return NULL;
+}
+
+static rsRetVal
+initFileWriteWorker(void) {
+	DEFiRet;
+	CHKiConcCtrl(pthread_mutex_init(&work_q.mut, NULL));
+	CHKiConcCtrl(pthread_cond_init(&work_q.wakeup_worker, NULL));
+	STAILQ_INIT(&work_q.q);
+	work_q.size = 0;
+	work_q.ctrMaxSz = 0;
+	CHKiRet(statsobj.Construct(&work_q.stats));
+	CHKiRet(statsobj.SetName(work_q.stats, (uchar*) "file-write-worker"));
+	CHKiRet(statsobj.SetOrigin(work_q.stats, (uchar*) "dynstats"));
+	STATSCOUNTER_INIT(work_q.ctrEnq, work_q.mutCtrEnq);
+	CHKiRet(statsobj.AddCounter(work_q.stats, UCHAR_CONSTANT("enqueued"),
+								ctrType_IntCtr, CTR_FLAG_RESETTABLE, &work_q.ctrEnq));
+	CHKiRet(statsobj.AddCounter(work_q.stats, UCHAR_CONSTANT("maxqsize"),
+								ctrType_Int, CTR_FLAG_NONE, &work_q.ctrMaxSz));
+	CHKiRet(statsobj.ConstructFinalize(work_q.stats));
+finalize_it:
+	RETiRet;
+}
+
+static void
+destroyFileWriteWorker(void) {
+	file_write_entry_t *task;
+	if (work_q.stats != NULL) {
+		statsobj.Destruct(&work_q.stats);
+	}
+	pthread_mutex_lock(&work_q.mut);
+	while (!STAILQ_EMPTY(&work_q.q)) {
+		task = STAILQ_FIRST(&work_q.q);
+		STAILQ_REMOVE_HEAD(&work_q.q, link);
+		LogError(0, RS_RET_INTERNAL_ERROR, "dynstats: discarded enqueued io-work to allow shutdown "
+								"- ignored");
+		free(task);
+	}
+	work_q.size = 0;
+	pthread_mutex_unlock(&work_q.mut);
+	pthread_cond_destroy(&work_q.wakeup_worker);
+	pthread_mutex_destroy(&work_q.mut);
+}
+
+static rsRetVal
+enqueueFileWriteTask(dynstats_bucket_t *b, const char* file_name, const char* content) {
+	file_write_entry_t *task;
+	DEFiRet;
+	
+	CHKmalloc(task = malloc(sizeof(file_write_entry_t)));
+	task->bucket = b;
+	task->name = strdup(file_name);
+	task->content = strdup(content);
+	
+	pthread_mutex_lock(&work_q.mut);
+	STAILQ_INSERT_TAIL(&work_q.q, task, link);
+	work_q.size++;
+	STATSCOUNTER_INC(work_q.ctrEnq, work_q.mutCtrEnq);
+	STATSCOUNTER_SETMAX_NOMUT(work_q.ctrMaxSz, work_q.size);
+	pthread_cond_signal(&work_q.wakeup_worker);
+	pthread_mutex_unlock(&work_q.mut);
+
+finalize_it:
+	if (iRet != RS_RET_OK) {
+		if (task == NULL) {
+			LogError(0, iRet, "dynstats: couldn't allocate memory to enqueue io-request - ignored");
+		}
+	}
+	RETiRet;
+}
+
+static void
+startFileWriteWorker(void) {
+	pthread_mutex_lock(&work_q.mut); /* locking to keep Coverity happy */
+	wrkrRunning = 0;
+	pthread_mutex_unlock(&work_q.mut);
+	pthread_create(&wrkrInfo.tid, NULL, fileWriteWorker, &wrkrInfo);
+	assert(wrkrInfo.tid);
+	DBGPRINTF("dynstats: worker started tid: %llu workers\n", (unsigned long long)wrkrInfo.tid);
+}
+
+static void
+stopFileWriteWorker(void) {
+	DBGPRINTF("dynstats: stoping worker pool\n");
+	pthread_mutex_lock(&work_q.mut);
+	pthread_cond_broadcast(&work_q.wakeup_worker); /* awake wrkr if not running */
+	pthread_mutex_unlock(&work_q.mut);
+	pthread_join(wrkrInfo.tid, NULL);
+	DBGPRINTF("dynstats: info: worker stopped\n");
+}
