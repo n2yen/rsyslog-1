@@ -51,7 +51,6 @@ struct modConfData_s {
 	instanceConf_t *root, *tail;
 };
 
-
 struct instanceConf_s {
 	uchar *pszBindRuleset;
 	uchar *pszEndpoint;
@@ -74,40 +73,28 @@ enqMsg(instanceConf_t *const __restrict__ inst,
 	assert(msg != NULL);
 	assert(pszTag != NULL);
 
-	printf("imsimple: enqMsg - before dbgOutputTID() \n");
-	dbgprintf("dbgprintf: hello from enqMsg\n");
-	DBGPRINTF("dbgprintf: hello from enqMsg\n");
-
-	// test dbg outputTID
-	uchar thrdName[32];
-	strcpy((char*)thrdName, "imsimple");
-	dbgOutputTID((char*)thrdName);
-
-	printf("imsimple: enqMsg - before msgConstruct() \n");
 	CHKiRet(msgConstruct(&pMsg));
-	printf("After msg Construct from enqMsg\n");
-	dbgprintf("dbgprintf: hello from enqMsg\n");
-	// MsgSetFlowControlType(pMsg, eFLOWCTL_NO_DELAY); // eFLOWCTL_LIGHT_DELAY, if we support flow control
-	// // 2nd param is a prop_t type (not a string)
-	// //MsgSetInputName(pMsg, "imhttp");
-	// MsgSetRawMsg(pMsg, (char*)msg, len);
-	// MsgSetMSGoffs(pMsg, 0);	// we do not have a header...
-	// MsgSetRcvFrom(pMsg, glbl.GetLocalHostNameProp());
-	// //MsgSetRcvFromIP(pMsg, pLocalHostIP);
-	// MsgSetHOSTNAME(pMsg, glbl.GetLocalHostName(), ustrlen(glbl.GetLocalHostName()));
-	// MsgSetTAG(pMsg, pszTag, ustrlen(pszTag));
-	// if (inst) {
-	// 	MsgSetRuleset(pMsg, inst->pBindRuleset);
-	// }
-	// //msgSetPRI(pMsg, pri);
-	// // use this later, since we haven't implemented a ratelimitter
-	// CHKiRet(submitMsg2(pMsg));
-	// //STATSCOUNTER_INC(statsCounter.ctrSubmitted, statsCounter.mutCtrSubmitted);
+	MsgSetFlowControlType(pMsg, eFLOWCTL_NO_DELAY); // eFLOWCTL_LIGHT_DELAY, if we support flow control
+	// 2nd param is a prop_t type (not a string)
+	//MsgSetInputName(pMsg, "imsimple");
+	MsgSetRawMsg(pMsg, (char*)msg, len);
+	MsgSetMSGoffs(pMsg, 0);	// we do not have a header...
+	MsgSetRcvFrom(pMsg, glbl.GetLocalHostNameProp());
+	//MsgSetRcvFromIP(pMsg, pLocalHostIP);
+	MsgSetHOSTNAME(pMsg, glbl.GetLocalHostName(), ustrlen(glbl.GetLocalHostName()));
+	MsgSetTAG(pMsg, pszTag, ustrlen(pszTag));
+	if (inst) {
+		MsgSetRuleset(pMsg, inst->pBindRuleset);
+	}
+	//msgSetPRI(pMsg, pri);
+	// use this later, since we haven't implemented a ratelimitter
+	CHKiRet(submitMsg2(pMsg));
+	//STATSCOUNTER_INC(statsCounter.ctrSubmitted, statsCounter.mutCtrSubmitted);
 finalize_it:
 	if (iRet != RS_RET_OK) {
 		// unexpected for now.
 		//STATSCOUNTER_INC(statsCounter.ctrDiscarded, statsCounter.mutCtrDiscarded);
-		printf("enqMsg error: %d\n", iRet);
+		dbgprintf("enqMsg error: %d\n", iRet);
 		assert(0);
 	}
 	RETiRet;
@@ -123,11 +110,8 @@ ENDnewInpInst
 BEGINbeginCnfLoad
 CODESTARTbeginCnfLoad
 	assert(pModConf);
-dbgprintf("imsimple: begincnfload\n");
-DBGPRINTF("imsimple: begincnfload\n");
 	loadModConf = pModConf;
 	pModConf->pConf = pConf;
-	goRunInput();
 ENDbeginCnfLoad
 
 BEGINsetModCnf
@@ -151,14 +135,11 @@ BEGINfreeCnf
 CODESTARTfreeCnf
 ENDfreeCnf
 
-extern int goCallbackHandler(int, int);
-
 static rsRetVal runInput(thrdInfo_t __attribute__((unused)) *pThrd)
 {
 	DEFiRet;
-	goCallbackHandler(3, 4);
 	goRunInput();
-	sleep(10);
+	//sleep(5);
 	RETiRet;
 }
 
@@ -197,10 +178,11 @@ CODEqueryEtryPt_IsCompatibleWithFeature_IF_OMOD_QUERIES
 
 
 static rsRetVal s_modInit(int iIFVersRequested,
-													int *ipIFVersProvided,
-													rsRetVal (**pQueryEtryPt)(),
-													rsRetVal (*pHostQueryEtryPt)(uchar*, rsRetVal (**)()),
-													modInfo_t *pModInfo) {
+	int *ipIFVersProvided,
+	rsRetVal (**pQueryEtryPt)(),
+	rsRetVal (*pHostQueryEtryPt)(uchar*, rsRetVal (**)()),
+	modInfo_t *pModInfo)
+{
 	DEFiRet;
 	rsRetVal (*pObjGetObjInterface)(obj_if_t *pIf);
 	assert(pHostQueryEtryPt != NULL);
@@ -232,28 +214,15 @@ typedef rsRetVal (*pHostQueryEtryPt)(uchar*, rsRetVal (**)());
 */
 import "C"
 
-import "unsafe"
-
 import (
 	"fmt"
-	"sort"
+	"unsafe"
 )
-
-//export atest
-func atest() C.int {
-	//cs := C.CString("Hello from stdio")
-	//C.myprint(cs)
-	//C.free(unsafe.Pointer(cs))
-	return 0
-}
 
 //export printTest
 func printTest() {
 	fmt.Println("hello from golang")
 }
-
-//export Sort
-func Sort(vals []int) { sort.Ints(vals) }
 
 //export modInit
 func modInit(iIFVersRequested C.int,
@@ -266,16 +235,11 @@ func modInit(iIFVersRequested C.int,
 		pHostQueryEtryPt, pModInfo)
 }
 
-//export goCallbackHandler
-func goCallbackHandler(a, b C.int) C.int {
-	return a + b
-}
-
 //export goRunInput
 func goRunInput() {
+	count := 10000
 	// allocate a simple c string
-	for i := 1; i < 5; i++ {
-		fmt.Println("hello from goRunInput")
+	for i := 0; i < count; i++ {
 		cs := C.CString("Hello from stdio")
 		C.enqMsg(nil, cs, C.strlen(cs))
 		C.free(unsafe.Pointer(cs))
@@ -283,17 +247,3 @@ func goRunInput() {
 }
 
 func main() {}
-
-/// ignore these for now.
-/*
-//export modInit
-func modInit(iIFVersRequested C.int,
-	ipIFVersProvided *C.int,
-	pQueryEtryPt *unsafe.Pointer,
-	pHostQueryEtryPt unsafe.Pointer,
-	pModInfo *C.modInfo_t) C.rsRetVal {
-	return C.s_modInit(iIFVersRequested, ipIFVersProvided, pQueryEtryPt,
-		pHostQueryEtryPt, pModInfo)
-
-}
-*/
