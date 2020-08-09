@@ -28,13 +28,10 @@
 #include "errmsg.h"
 #include "perctile_stats.h"
 #include "hashtable_itr.h"
+#include "perctile_ringbuf.h"
 
 #include <stdio.h>
-#include <assert.h>
 #include <pthread.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdbool.h>
 #include <math.h>
 
 //#define PERCTILE_STATS_DEBUG
@@ -85,138 +82,6 @@ static uint64_t max(uint64_t a, uint64_t b) {
 	return a > b ? a : b;
 }
 
-/*
- * circ buf macros derived from linux/circ_buf.h
- */
-
-typedef int64_t ITEM;
-
-struct circ_buf {
-	ITEM *buf;
-	int head;
-	int tail;
-};
-
-/* Return count in buffer.  */
-#define CIRC_CNT(head,tail,size) (((head) - (tail)) & ((size)-1))
-
-/* Return space available, 0..size-1.  We always leave one free char
-	 as a completely full buffer has head == tail, which is the same as
-	 empty.  */
-#define CIRC_SPACE(head,tail,size) CIRC_CNT((tail),((head)+1),(size))
-
-/* Return count up to the end of the buffer.  Carefully avoid
-	 accessing head and tail more than once, so they can change
-	 underneath us without returning inconsistent results.  */
-#define CIRC_CNT_TO_END(head,tail,size) \
-	({int end = (size) - (tail); \
-	 int n = ((head) + end) & ((size)-1); \
-	 n < end ? n : end;})
-
-/* Return space available up to the end of the buffer.  */
-#define CIRC_SPACE_TO_END(head,tail,size) \
-	({int end = (size) - 1 - (head); \
-	 int n = (end + (tail)) & ((size)-1); \
-	 n <= end ? n : end+1;})
-
-/* Move head by size. */
-#define CIRC_ADD(idx, size, offset)	(((idx) + (offset)) & ((size) - 1))
-
-// simple use of the linux defined circular buffer.
-
-typedef struct ringbuf_s {
-	struct circ_buf cb;
-	size_t size;
-} ringbuf_t;
-
-ringbuf_t* ringbuf_new(size_t count) {
-	// use nearest power of 2
-	double x = ceil(log2(count));
-	size_t bufsize = pow(2, x);
-
-	ringbuf_t *rb = calloc(1, sizeof(ringbuf_t));
-	// note count needs to be a power of 2, otherwise our macros won't work.
-	ITEM *pbuf = calloc(bufsize, sizeof(ITEM));
-	rb->cb.buf = pbuf;
-	rb->cb.head = rb->cb.tail = 0;
-	rb->size = bufsize;
-
-	return rb;
-}
-
-void ringbuf_del(ringbuf_t *rb) {
-	if (rb) {
-		if (rb->cb.buf) {
-			free(rb->cb.buf);
-		}
-		free(rb);
-	}
-}
-
-int ringbuf_append(ringbuf_t *rb, ITEM item) {
-	// lock it and add
-	int head = rb->cb.head,
-			tail = rb->cb.tail;
-
-	if (!CIRC_SPACE(head, tail, rb->size)) {
-		return -1;
-	} else {
-		/* insert item into buffer */
-		rb->cb.buf[head] = item;
-		// move head
-		rb->cb.head = CIRC_ADD(head, rb->size, 1);
-	}
-	return 0;
-}
-
-int ringbuf_append_with_overwrite(ringbuf_t *rb, ITEM item) {
-	int head = rb->cb.head,
-			tail = rb->cb.tail;
-
-	if (!CIRC_SPACE(head, tail, rb->size)) {
-		rb->cb.tail = CIRC_ADD(tail, rb->size, 1);
-	}
-	int ret = ringbuf_append(rb, item);
-	assert(ret == 0); // we shouldn't fail due to no space.
-	return ret;
-}
-
-int ringbuf_read(ringbuf_t *rb, ITEM *buf, size_t count) {
-	int head = rb->cb.head,
-			tail = rb->cb.tail;
-
-	if (!CIRC_CNT(head, tail, rb->size)) {
-		return 0;
-	}
-
-	// copy to end of buffer
-	size_t copy_size = min((size_t)CIRC_CNT_TO_END(head, tail, rb->size), count);
-	memcpy(buf, rb->cb.buf+tail, copy_size*sizeof(ITEM));
-
-	rb->cb.tail = CIRC_ADD(rb->cb.tail, rb->size, copy_size);
-	return copy_size;
-}
-
-size_t ringbuf_read_to_end(ringbuf_t *rb, ITEM *buf, size_t count) {
-	size_t nread = 0;
-	nread += ringbuf_read(rb, buf, count);
-	if (nread == 0) {
-		return nread;
-	}
-	// read the rest if buf circled around
-	nread += ringbuf_read(rb, buf+nread, count);
-	return nread;
-}
-
-bool ringbuf_peek(ringbuf_t *rb, ITEM *item) {
-	if (CIRC_CNT(rb->cb.head, rb->cb.tail, rb->size) == 0) {
-		return false;
-	}
-
-	*item = rb->cb.buf[rb->cb.head];
-	return true;
-}
-
 static void perctileStatDestruct(void* p) {
 	if (p) {
 		perctile_stat_t *perc_stat = (perctile_stat_t *)p;
@@ -233,7 +98,6 @@ static void perctileStatDestruct(void* p) {
 			free(perc_stat->ctrs);
 		}
 		pthread_rwlock_destroy(&perc_stat->stats_lock);
-		//pthread_rwlock_destroy(&perc_stat->rb_lock);
 		free(perc_stat);
 	}
 }
@@ -373,7 +237,6 @@ perctile_observe(perctile_bucket_t *bkt, uchar* key, int64_t value) {
 		CHKmalloc(pstat->ctrs = (perctile_ctr_t*)calloc(bkt->perctile_values_count, sizeof(perctile_stat_t)));
 		pstat->perctile_ctrs_count = bkt->perctile_values_count;
 		CHKmalloc(pstat->rb_observed_stats = ringbuf_new(bkt->window_size));
-		//pthread_rwlock_init(&pstat->rb_lock, NULL);
 		pthread_rwlock_init(&pstat->stats_lock, NULL);
 
 		// init all stat counters here
@@ -446,7 +309,7 @@ static int cmp(const void* p1, const void* p2) {
 	return (*(ITEM*)p1) - (*(ITEM*)p2);
 }
 
-static void report_perctile_stats(perctile_bucket_t* pbkt) {
+static rsRetVal report_perctile_stats(perctile_bucket_t* pbkt) {
 	ITEM *buf = NULL;
 	struct hashtable_itr *itr = NULL;
 	DEFiRet;
@@ -465,7 +328,8 @@ static void report_perctile_stats(perctile_bucket_t* pbkt) {
 				FINALIZE;
 			}
 			PERCTILE_STATS_LOG("read %zu values\n", count);
-			// calculate the p95 based on the 
+			// calculate the p95 based on the
+#ifdef PERCTILE_STATS_DEBUG
 			PERCTILE_STATS_LOG("ringbuffer contents... \n");
 			for (size_t i = 0; i < perc_stat->rb_observed_stats->size; ++i) {
 				PERCTILE_STATS_LOG("%lld ", perc_stat->rb_observed_stats->cb.buf[i]);
@@ -477,19 +341,20 @@ static void report_perctile_stats(perctile_bucket_t* pbkt) {
 				PERCTILE_STATS_LOG("%lld ", buf[i]);
 			}
 			PERCTILE_STATS_LOG("\n");
+#endif
 			qsort(buf, count, sizeof(ITEM), cmp);
-
+#ifdef PERCTILE_STATS_DEBUG
 			PERCTILE_STATS_LOG("buffer contents after sort... \n");
 			for (size_t i = 0; i < perc_stat->rb_observed_stats->size; ++i) {
 				PERCTILE_STATS_LOG("%lld ", buf[i]);
 			}
 			PERCTILE_STATS_LOG("\n");
-
+#endif
 			PERCTILE_STATS_LOG("report_perctile_stats() - perctile stat has %zu counters.", perc_stat->perctile_ctrs_count);
 			for (size_t i = 0; i < perc_stat->perctile_ctrs_count; ++i) {
 				perctile_ctr_t *pctr = &perc_stat->ctrs[i];
 				// get percentile - this can be cached.
-				int index = ((pctr->percentile/100.0) * count)-1;
+				int index = max(0, ((pctr->percentile/100.0) * count)-1);
 				// look into if we need to lock this.
 				pctr->perctile_stat = buf[index];
 				PERCTILE_STATS_LOG("report_perctile_stats() - index: %d, perctile stat [%s, %d, %llu]", index, pctr->name, pctr->percentile, pctr->perctile_stat);
@@ -501,6 +366,7 @@ finalize_it:
 	pthread_rwlock_unlock(&pbkt->lock);
 	free(itr);
 	free(buf);
+	RETiRet;
 }
 
 static void
@@ -615,12 +481,6 @@ perctile_newBucket(const uchar *name, uint8_t *perctiles, uint32_t perctilesCoun
 			PERCTILE_STATS_LOG("perctile_newBucket: prepended new bucket list \n");
 		}
 
-		// assert we can find the newly added bucket
-		{
-			perctile_bucket_t *pb = findBucket(bkts->listBuckets, name);
-			assert(pb);
-		}
-
 		// create the statsobj for this bucket
 		CHKiRet(perctileInitNewBucketStats(b));
 		CHKiRet(perctileAddBucketMetrics(bkts, b, name));
@@ -718,8 +578,9 @@ perctile_findBucket(const uchar* name) {
 	perctile_buckets_t *bkts = &loadConf->perctile_buckets;
 	if (bkts->initialized) {
 		pthread_rwlock_rdlock(&bkts->lock);
-		b = findBucket(bkts->listBuckets, name);
-		assert(b);
+		if (bkts->listBuckets) {
+			b = findBucket(bkts->listBuckets, name);
+		}
 		pthread_rwlock_unlock(&bkts->lock);
 	} else {
 		LogError(0, RS_RET_INTERNAL_ERROR, "perctile: bucket lookup failed, as global-initialization "
@@ -735,7 +596,8 @@ perctile_obs(perctile_bucket_t *perctile_bkt, uchar* key, int64_t value) {
 		LogError(0, RS_RET_INTERNAL_ERROR, "perctile() - perctile bkt not available");
 		FINALIZE;
 	}
-	PERCTILE_STATS_LOG("perctile_obs() - bucket name: %s, key: %s, val: %lld\n", perctile_bkt->name, key, value);
+	PERCTILE_STATS_LOG("perctile_obs() - bucket name: %s, key: %s, val: %" PRId64 "\n",
+										 perctile_bkt->name, key, value);
 
 	CHKiRet(perctile_observe(perctile_bkt, key, value));
 

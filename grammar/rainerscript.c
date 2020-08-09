@@ -3419,8 +3419,8 @@ initFunc_perctile_obs(struct cnffunc *func)
 
 	func->funcdata = NULL;
 	if (func->expr[0]->nodetype != 'S') {
-		parser_errmsg("perctile-stats bucket-name (param 1) of perctile-stats manipulating "
-		"functions like perctile_observe must be a constant string");
+		parser_errmsg("percentile-stats bucket-name (param 1) of perctile-stats manipulating "
+		"functions like percentile_observe must be a constant string");
 		FINALIZE;
 	}
 
@@ -3436,7 +3436,7 @@ finalize_it:
 }
 
 static void ATTR_NONNULL()
-doFunc_perctile_obs(struct cnffunc *__restrict__ const func,
+doFunc_percentile_obs(struct cnffunc *__restrict__ const func,
 	struct svar *__restrict__ const ret,
 	void *__restrict__ const usrptr,
 	wti_t *__restrict__ const pWti)
@@ -3461,7 +3461,7 @@ doFunc_perctile_obs(struct cnffunc *__restrict__ const func,
 	long long val = var2Number(&srcVal2, &success);
 	if (!success) {
 		char *cstr2 = es_str2cstr(srcVal2.d.estr, NULL);
-		parser_errmsg("rainerscript: dynstats_perctile_obs - didn't get a valid number: %s\n", cstr2);
+		parser_errmsg("rainerscript: percentile_obs - didn't get a valid number: %s\n", cstr2);
 		free(cstr2);
 		retVal = 0;
 		FINALIZE;
@@ -3646,7 +3646,7 @@ static struct scriptFunct functions[] = {
 	{"prifilt", 1, 1, doFunct_Prifilt, initFunc_prifilt, NULL},
 	{"lookup", 2, 2, doFunct_Lookup, resolveLookupTable, NULL},
 	{"dyn_inc", 2, 2, doFunct_DynInc, initFunc_dyn_stats, NULL},
-	{"perctile_observe", 3, 3, doFunc_perctile_obs, initFunc_perctile_obs, NULL},
+	{"percentile_observe", 3, 3, doFunc_percentile_obs, initFunc_perctile_obs, NULL},
 	{"replace", 3, 3, doFunct_Replace, NULL, NULL},
 	{"wrap", 2, 3, doFunct_Wrap, NULL, NULL},
 	{"random", 1, 1, doFunct_RandomGen, NULL, NULL},

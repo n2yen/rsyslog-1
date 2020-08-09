@@ -32,9 +32,6 @@ struct perctile_ctr_s {
 
 struct perctile_stat_s {
 	uchar *name;
-
-	// not needed for now.
-	//pthread_rwlock_t rb_lock;
 	struct ringbuf_s *rb_observed_stats;
 
 	// array of requested perctile to track

@@ -953,6 +953,7 @@ endif # ENABLE_OMRABBITMQ
 if ENABLE_IMPSTATS
 TESTS +=  \
 	impstats-hup.sh \
+	perctile-simple.sh \
 	dynstats.sh \
 	dynstats_overflow.sh \
 	dynstats_reset.sh \
@@ -968,6 +969,7 @@ TESTS +=  \
 	dynstats_prevent_premature_eviction.sh
 if HAVE_VALGRIND
 TESTS +=  \
+	perctile-simple-vg.sh \
 	dynstats-vg.sh \
 	dynstats_reset-vg.sh \
 	dynstats_overflow-vg.sh \
@@ -2355,6 +2357,8 @@ EXTRA_DIST= \
 	testsuites/dynstats_input_more_2 \
 	no-dynstats-json.sh \
 	no-dynstats.sh \
+	perctile-simple.sh \
+	perctile-simple-vg.sh \
 	stats-json.sh \
 	stats-json-vg.sh \
 	stats-cee.sh \
