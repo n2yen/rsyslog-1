@@ -23,15 +23,15 @@
 #include "statsobj.h"
 
 struct perctile_ctr_s {
-	uchar* name;
 	// percentile [0,100]
 	uint8_t percentile;
 	size_t index;
-	intctr_t perctile_stat;
+	intctr_t ctr_perctile_stat;
+	ctr_t *ref_ctr_percentile_stat;
 };
 
 struct perctile_stat_s {
-	uchar *name;
+	uchar name[128];
 	struct ringbuf_s *rb_observed_stats;
 
 	// array of requested perctile to track
@@ -39,18 +39,35 @@ struct perctile_stat_s {
 	size_t perctile_ctrs_count;
 
 	pthread_rwlock_t stats_lock;
+
 	intctr_t ctrWindowCount;
+	ctr_t *refCtrWindowCount;
+
 	intctr_t ctrWindowMin;
+	ctr_t *refCtrWindowMin;
+
 	intctr_t ctrWindowMax;
+	ctr_t *refCtrWindowMax;
+
 	intctr_t ctrWindowSum;
+	ctr_t *refCtrWindowSum;
+
 	intctr_t ctrHistoricalWindowCount;
+	ctr_t *refCtrHistoricalWindowCount;
+
 	intctr_t ctrHistoricalWindowMin;
+	ctr_t *refCtrHistoricalWindowMin;
+
 	intctr_t ctrHistoricalWindowMax;
+	ctr_t *refCtrHistoricalWindowMax;
+
 	intctr_t ctrHistoricalWindowSum;
+	ctr_t *refCtrHistoricalWindowSum;
 };
 
 struct perctile_bucket_s {
 	uchar *name;
+	uchar *delim;
 
 	// lock for entire bucket
 	pthread_rwlock_t lock;

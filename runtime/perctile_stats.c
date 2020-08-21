@@ -46,17 +46,19 @@
 DEFobjStaticHelpers
 DEFobjCurrIf(statsobj)
 
-#define PERCTILE_PARAM_NAME        "name"
-#define PERCTILE_PARAM_PERCENTILES "percentiles"
-#define PERCTILE_PARAM_WINDOW_SIZE "windowsize"
+#define PERCTILE_CONF_PARAM_NAME        "name"
+#define PERCTILE_CONF_PARAM_PERCENTILES "percentiles"
+#define PERCTILE_CONF_PARAM_WINDOW_SIZE "windowsize"
+#define PERCTILE_CONF_PARAM_DELIM       "delimiter"
 
 #define PERCTILE_MAX_BUCKET_NS_METRIC_LENGTH  128
 #define PERCTILE_METRIC_NAME_SEPARATOR        '.'
 
 static struct cnfparamdescr modpdescr[] = {
-	{ PERCTILE_PARAM_NAME, eCmdHdlrString, CNFPARAM_REQUIRED },
-	{ PERCTILE_PARAM_PERCENTILES, eCmdHdlrArray, 0},
-	{ PERCTILE_PARAM_WINDOW_SIZE, eCmdHdlrPositiveInt, 0},
+	{ PERCTILE_CONF_PARAM_NAME, eCmdHdlrString, CNFPARAM_REQUIRED },
+	{ PERCTILE_CONF_PARAM_DELIM, eCmdHdlrString, 0},
+	{ PERCTILE_CONF_PARAM_PERCENTILES, eCmdHdlrArray, 0},
+	{ PERCTILE_CONF_PARAM_WINDOW_SIZE, eCmdHdlrPositiveInt, 0},
 };
 
 static struct cnfparamblk modpblk = {
@@ -82,23 +84,49 @@ static uint64_t max(uint64_t a, uint64_t b) {
 	return a > b ? a : b;
 }
 
-static void perctileStatDestruct(void* p) {
-	if (p) {
-		perctile_stat_t *perc_stat = (perctile_stat_t *)p;
-		if (perc_stat->name) {
-			free(perc_stat->name);
+static void perctileStatDestruct(perctile_bucket_t *b, perctile_stat_t *pstat) {
+	if (pstat) {
+		if (pstat->rb_observed_stats) {
+			ringbuf_del(pstat->rb_observed_stats);
 		}
-		if (perc_stat->rb_observed_stats) {
-			ringbuf_del(perc_stat->rb_observed_stats);
-		}
-		if (perc_stat->ctrs) {
-			for (size_t i = 0; i < perc_stat->perctile_ctrs_count; ++i) {
-				free(perc_stat->ctrs[i].name);
+
+		if (pstat->ctrs) {
+			for (size_t i = 0; i < pstat->perctile_ctrs_count; ++i) {
+				perctile_ctr_t *ctr = &pstat->ctrs[i];
+				if (ctr->ref_ctr_percentile_stat) {
+					statsobj.DestructCounter(b->statsobj, ctr->ref_ctr_percentile_stat);
+				}
 			}
-			free(perc_stat->ctrs);
+			free(pstat->ctrs);
 		}
-		pthread_rwlock_destroy(&perc_stat->stats_lock);
-		free(perc_stat);
+
+		if (pstat->refCtrWindowCount) {
+			statsobj.DestructCounter(b->statsobj, pstat->refCtrWindowCount);
+		}
+		if (pstat->refCtrWindowMin) {
+			statsobj.DestructCounter(b->statsobj, pstat->refCtrWindowMin);
+		}
+		if (pstat->refCtrWindowMax) {
+			statsobj.DestructCounter(b->statsobj, pstat->refCtrWindowMax);
+		}
+		if (pstat->refCtrWindowSum) {
+			statsobj.DestructCounter(b->statsobj, pstat->refCtrWindowSum);
+		}
+		if (pstat->refCtrHistoricalWindowCount) {
+			statsobj.DestructCounter(b->statsobj, pstat->refCtrHistoricalWindowCount);
+		}
+		if (pstat->refCtrHistoricalWindowMin) {
+			statsobj.DestructCounter(b->statsobj, pstat->refCtrHistoricalWindowMin);
+		}
+		if (pstat->refCtrHistoricalWindowMax) {
+			statsobj.DestructCounter(b->statsobj, pstat->refCtrHistoricalWindowMax);
+		}
+		if (pstat->refCtrHistoricalWindowSum) {
+			statsobj.DestructCounter(b->statsobj, pstat->refCtrHistoricalWindowSum);
+		}
+
+		pthread_rwlock_destroy(&pstat->stats_lock);
+		free(pstat);
 	}
 }
 
@@ -106,11 +134,26 @@ static void perctileBucketDestruct(perctile_bucket_t *bkt) {
 	PERCTILE_STATS_LOG("destructing perctile bucket\n");
 	if (bkt) {
 		pthread_rwlock_wrlock(&bkt->lock);
-		hashtable_destroy(bkt->htable, 1); // destroy all perctile stats
+		// Delete all items in hashtable
+		size_t count = hashtable_count(bkt->htable);
+		if (count) {
+			int ret = 0;
+			struct hashtable_itr *itr = hashtable_iterator(bkt->htable);
+			dbgprintf("%s() - All container instances, count=%zu...\n", __FUNCTION__, count);
+			do {
+				perctile_stat_t *pstat = hashtable_iterator_value(itr);
+				perctileStatDestruct(bkt, pstat);
+				ret = hashtable_iterator_advance(itr);
+			} while (ret);
+			free (itr);
+			dbgprintf("End of container instances.\n");
+		}
+		hashtable_destroy(bkt->htable, 0);
 		statsobj.Destruct(&bkt->statsobj);
 		pthread_rwlock_unlock(&bkt->lock);
 		pthread_rwlock_destroy(&bkt->lock);
 		free(bkt->perctile_values);
+		free(bkt->delim);
 		free(bkt->name);
 		free(bkt);
 	}
@@ -169,54 +212,109 @@ print_perctiles(perctile_bucket_t *bkt) {
 
 // Assumes a fully created pstat and bkt, also initiliazes some values in pstat.
 static rsRetVal
-initAndAddPerctileMetrics(perctile_bucket_t *bkt, perctile_stat_t *pstat) {
+initAndAddPerctileMetrics(perctile_stat_t *pstat, perctile_bucket_t *bkt, uchar* key) {
 	char stat_name[128];
+	int bytes = 0;
+	int stat_name_len = sizeof(stat_name);
 	DEFiRet;
 
-	size_t offset = snprintf(stat_name, sizeof(stat_name), "%s_%s_", (char*)bkt->name, (char*)pstat->name);
-	size_t remaining_size = sizeof(stat_name) - offset;
+	bytes = snprintf((char*)pstat->name, sizeof(pstat->name), "%s", key);
+	if (bytes < 0 || bytes >= (int) sizeof(pstat->name)) {
+		LogError(0, iRet, "statname '%s' truncated - too long for buffer size: %d\n", stat_name, stat_name_len);
+		ABORT_FINALIZE(RS_RET_CONF_PARAM_INVLD);
+	}
 
+	int offset = snprintf(stat_name, stat_name_len, "%s%s", (char*)pstat->name, (char*)bkt->delim);
+	if (offset < 0 || offset >= stat_name_len) {
+		LogError(0, iRet, "statname '%s' truncated - too long for buffer size: %d\n", stat_name, stat_name_len);
+		ABORT_FINALIZE(RS_RET_CONF_PARAM_INVLD);
+	}
+
+	int remaining_size = stat_name_len - offset - 1;
 	// initialize the counters array
 	for (size_t i = 0; i < pstat->perctile_ctrs_count; ++i) {
 		perctile_ctr_t *ctr = &pstat->ctrs[i];
 
 		// bucket contains the supported percentile values.
 		ctr->percentile = bkt->perctile_values[i];
-		snprintf(stat_name+offset, remaining_size, "p%d", bkt->perctile_values[i]);
-		CHKmalloc(ctr->name = ustrdup(stat_name));
-
-		PERCTILE_STATS_LOG("perctile_observe - creating perctile stat counter: %s\n",
-				ctr->name);
-		CHKiRet(statsobj.AddCounter(bkt->statsobj, (uchar *)ctr->name, ctrType_IntCtr, CTR_FLAG_NONE, &ctr->perctile_stat));
+		bytes = snprintf(stat_name+offset, remaining_size, "p%d", bkt->perctile_values[i]);
+		if (bytes < 0 || bytes >= remaining_size) {
+			LogError(0, iRet, "statname '%s' truncated - too long for buffer size: %d\n", stat_name, stat_name_len);
+			ABORT_FINALIZE(RS_RET_CONF_PARAM_INVLD);
+		}
+		CHKiRet(statsobj.AddManagedCounter(bkt->statsobj, (uchar *)stat_name, ctrType_IntCtr,
+			CTR_FLAG_NONE, &ctr->ctr_perctile_stat, &ctr->ref_ctr_percentile_stat, 1));
 	}
 
-	strncpy(stat_name+offset, "window_min", remaining_size);
-	CHKiRet(statsobj.AddCounter(bkt->statsobj, (uchar *)stat_name, ctrType_IntCtr, CTR_FLAG_NONE, &pstat->ctrWindowMin));
+	bytes = snprintf(stat_name+offset, remaining_size, "window_min");
+	if (bytes < 0 || bytes >= remaining_size) {
+		LogError(0, iRet, "statname '%s' truncated - too long for buffer size: %d\n", stat_name, stat_name_len);
+		ABORT_FINALIZE(RS_RET_CONF_PARAM_INVLD);
+	}
+	CHKiRet(statsobj.AddManagedCounter(bkt->statsobj, (uchar *)stat_name, ctrType_IntCtr,
+		CTR_FLAG_NONE, &pstat->ctrWindowMin, &pstat->refCtrWindowMin, 1));
 
-	strncpy(stat_name+offset, "window_max", remaining_size);
-	CHKiRet(statsobj.AddCounter(bkt->statsobj, (uchar *)stat_name, ctrType_IntCtr, CTR_FLAG_NONE, &pstat->ctrWindowMax));
+	bytes = snprintf(stat_name+offset, remaining_size, "window_max");
+	if (bytes < 0 || bytes >= remaining_size) {
+		LogError(0, iRet, "statname '%s' truncated - too long for buffer size: %d\n", stat_name, stat_name_len);
+		ABORT_FINALIZE(RS_RET_CONF_PARAM_INVLD);
+	}
+	CHKiRet(statsobj.AddManagedCounter(bkt->statsobj, (uchar *)stat_name, ctrType_IntCtr,
+		CTR_FLAG_NONE, &pstat->ctrWindowMax, &pstat->refCtrWindowMax, 1));
 
-	strncpy(stat_name+offset, "window_sum", remaining_size);
-	CHKiRet(statsobj.AddCounter(bkt->statsobj, (uchar *)stat_name, ctrType_IntCtr, CTR_FLAG_NONE, &pstat->ctrWindowSum));
+	bytes = snprintf(stat_name+offset, remaining_size, "window_sum");
+	if (bytes < 0 || bytes >= remaining_size) {
+		LogError(0, iRet, "statname '%s' truncated - too long for buffer size: %d\n", stat_name, stat_name_len);
+		ABORT_FINALIZE(RS_RET_CONF_PARAM_INVLD);
+	}
+	CHKiRet(statsobj.AddManagedCounter(bkt->statsobj, (uchar *)stat_name, ctrType_IntCtr,
+		CTR_FLAG_NONE, &pstat->ctrWindowSum, &pstat->refCtrWindowSum, 1));
 
-	strncpy(stat_name+offset, "window_count", remaining_size);
-	CHKiRet(statsobj.AddCounter(bkt->statsobj, (uchar *)stat_name, ctrType_IntCtr, CTR_FLAG_NONE, &pstat->ctrWindowCount));
-
+	bytes = snprintf(stat_name+offset, remaining_size, "window_count");
+	if (bytes < 0 || bytes >= remaining_size) {
+		LogError(0, iRet, "statname '%s' truncated - too long for buffer size: %d\n", stat_name, stat_name_len);
+		ABORT_FINALIZE(RS_RET_CONF_PARAM_INVLD);
+	}
+	CHKiRet(statsobj.AddManagedCounter(bkt->statsobj, (uchar *)stat_name, ctrType_IntCtr,
+		CTR_FLAG_NONE, &pstat->ctrWindowCount, &pstat->refCtrWindowCount, 1));
 
 	// historical counters
-	strncpy(stat_name+offset, "historical_window_min", remaining_size);
-	CHKiRet(statsobj.AddCounter(bkt->statsobj, (uchar *)stat_name, ctrType_IntCtr, CTR_FLAG_NONE, &pstat->ctrHistoricalWindowMin));
+	bytes = snprintf(stat_name+offset, remaining_size, "historical_window_min");
+	if (bytes < 0 || bytes >= remaining_size) {
+		LogError(0, iRet, "statname '%s' truncated - too long for buffer size: %d\n", stat_name, stat_name_len);
+		ABORT_FINALIZE(RS_RET_CONF_PARAM_INVLD);
+	}
+	CHKiRet(statsobj.AddManagedCounter(bkt->statsobj, (uchar *)stat_name, ctrType_IntCtr,
+		CTR_FLAG_NONE, &pstat->ctrHistoricalWindowMin, &pstat->refCtrHistoricalWindowMin, 1));
 
-	strncpy(stat_name+offset, "historical_window_max", remaining_size);
-	CHKiRet(statsobj.AddCounter(bkt->statsobj, (uchar *)stat_name, ctrType_IntCtr, CTR_FLAG_NONE, &pstat->ctrHistoricalWindowMax));
+	bytes = snprintf(stat_name+offset, remaining_size, "historical_window_max");
+	if (bytes < 0 || bytes >= remaining_size) {
+		LogError(0, iRet, "statname '%s' truncated - too long for buffer size: %d\n", stat_name, stat_name_len);
+		ABORT_FINALIZE(RS_RET_CONF_PARAM_INVLD);
+	}
+	CHKiRet(statsobj.AddManagedCounter(bkt->statsobj, (uchar *)stat_name, ctrType_IntCtr,
+		CTR_FLAG_NONE, &pstat->ctrHistoricalWindowMax, &pstat->refCtrHistoricalWindowMax, 1));
 
-	strncpy(stat_name+offset, "historical_window_sum", remaining_size);
-	CHKiRet(statsobj.AddCounter(bkt->statsobj, (uchar *)stat_name, ctrType_IntCtr, CTR_FLAG_NONE, &pstat->ctrHistoricalWindowSum));
+	bytes = snprintf(stat_name+offset, remaining_size, "historical_window_sum");
+	if (bytes < 0 || bytes >= remaining_size) {
+		LogError(0, iRet, "statname '%s' truncated - too long for buffer size: %d\n", stat_name, stat_name_len);
+		ABORT_FINALIZE(RS_RET_CONF_PARAM_INVLD);
+	}
+	CHKiRet(statsobj.AddManagedCounter(bkt->statsobj, (uchar *)stat_name, ctrType_IntCtr,
+		CTR_FLAG_NONE, &pstat->ctrHistoricalWindowSum, &pstat->refCtrHistoricalWindowSum, 1));
 
-	strncpy(stat_name+offset, "historical_window_count", remaining_size);
-	CHKiRet(statsobj.AddCounter(bkt->statsobj, (uchar *)stat_name, ctrType_IntCtr, CTR_FLAG_NONE, &pstat->ctrHistoricalWindowCount));
+	bytes = snprintf(stat_name+offset, remaining_size, "historical_window_count");
+	if (bytes < 0 || bytes >= remaining_size) {
+		LogError(0, iRet, "statname '%s' truncated - too long for buffer size: %d\n", stat_name, stat_name_len);
+		ABORT_FINALIZE(RS_RET_CONF_PARAM_INVLD);
+	}
+	CHKiRet(statsobj.AddManagedCounter(bkt->statsobj, (uchar *)stat_name, ctrType_IntCtr,
+		CTR_FLAG_NONE, &pstat->ctrHistoricalWindowCount, &pstat->refCtrHistoricalWindowCount, 1));
 
 finalize_it:
+	if (iRet != RS_RET_OK) {
+		LogError(0, iRet, "Could not initialize percentile stats.");
+	}
 	RETiRet;
 }
 
@@ -233,8 +331,7 @@ perctile_observe(perctile_bucket_t *bkt, uchar* key, int64_t value) {
 		PERCTILE_STATS_LOG("perctile_observe(): key '%s' not found - creating new pstat", key);
 		// create the pstat if not found
 		CHKmalloc(pstat = calloc(1, sizeof(perctile_stat_t)));
-		CHKmalloc(pstat->name = ustrdup(key));
-		CHKmalloc(pstat->ctrs = (perctile_ctr_t*)calloc(bkt->perctile_values_count, sizeof(perctile_stat_t)));
+		CHKmalloc(pstat->ctrs = calloc(bkt->perctile_values_count, sizeof(perctile_ctr_t)));
 		pstat->perctile_ctrs_count = bkt->perctile_values_count;
 		CHKmalloc(pstat->rb_observed_stats = ringbuf_new(bkt->window_size));
 		pthread_rwlock_init(&pstat->stats_lock, NULL);
@@ -247,10 +344,15 @@ perctile_observe(perctile_bucket_t *bkt, uchar* key, int64_t value) {
 		pstat->ctrHistoricalWindowMin = sizeof(pstat->ctrHistoricalWindowMin);
 		pthread_rwlock_unlock(&pstat->stats_lock);
 
-		CHKiRet(initAndAddPerctileMetrics(bkt, pstat));
+		iRet = initAndAddPerctileMetrics(pstat, bkt, key);
+		if (iRet != RS_RET_OK) {
+			perctileStatDestruct(bkt, pstat);
+			ABORT_FINALIZE(iRet);
+		}
+
 		CHKmalloc(hash_key = ustrdup(key));
 		if (!hashtable_insert(bkt->htable, hash_key, pstat)) {
-			perctileStatDestruct(pstat);
+			perctileStatDestruct(bkt, pstat);
 			free(hash_key);
 			ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
 		}
@@ -283,7 +385,7 @@ perctile_observe(perctile_bucket_t *bkt, uchar* key, int64_t value) {
 	}
 	pthread_rwlock_unlock(&pstat->stats_lock);
 
-#if PERCTILE_STATS_DEBUG
+#ifdef PERCTILE_STATS_DEBUG
 	PERCTILE_STATS_LOG("perctile_observe - appended value: %lld to ringbuffer\n", value);
 	PERCTILE_STATS_LOG("ringbuffer contents... \n");
 	for (size_t i = 0; i < pstat->rb_observed_stats->size; ++i) {
@@ -356,8 +458,9 @@ static rsRetVal report_perctile_stats(perctile_bucket_t* pbkt) {
 				// get percentile - this can be cached.
 				int index = max(0, ((pctr->percentile/100.0) * count)-1);
 				// look into if we need to lock this.
-				pctr->perctile_stat = buf[index];
-				PERCTILE_STATS_LOG("report_perctile_stats() - index: %d, perctile stat [%s, %d, %llu]", index, pctr->name, pctr->percentile, pctr->perctile_stat);
+				pctr->ctr_perctile_stat = buf[index];
+				PERCTILE_STATS_LOG("report_perctile_stats() - index: %d, perctile stat [%s, %d, %llu]",
+					index, perc_stat->name, pctr->percentile, pctr->ctr_perctile_stat);
 			}
 		} while (hashtable_iterator_advance(itr));
 	}
@@ -385,7 +488,7 @@ perctileInitNewBucketStats(perctile_bucket_t *b) {
 	DEFiRet;
 
 	CHKiRet(statsobj.Construct(&b->statsobj));
-	CHKiRet(statsobj.SetOrigin(b->statsobj, UCHAR_CONSTANT("percstats.bucket")));
+	CHKiRet(statsobj.SetOrigin(b->statsobj, UCHAR_CONSTANT("percentile.bucket")));
 	CHKiRet(statsobj.SetName(b->statsobj, b->name));
 	CHKiRet(statsobj.SetReportingNamespace(b->statsobj, UCHAR_CONSTANT("values")));
 	statsobj.SetReadNotifier(b->statsobj, perctile_readCallback, b);
@@ -442,7 +545,7 @@ finalize_it:
 /* Create new perctile bucket, and add it to our list of perctile buckets.
 */
 static rsRetVal
-perctile_newBucket(const uchar *name, uint8_t *perctiles, uint32_t perctilesCount, uint32_t windowSize) {
+perctile_newBucket(const uchar *name, const uchar *delim, uint8_t *perctiles, uint32_t perctilesCount, uint32_t windowSize) {
 	perctile_buckets_t *bkts;
 	perctile_bucket_t* b = NULL;
 	pthread_rwlockattr_t bucket_lock_attr;
@@ -456,8 +559,13 @@ perctile_newBucket(const uchar *name, uint8_t *perctiles, uint32_t perctilesCoun
 
 		// initialize
 		pthread_rwlock_init(&b->lock, &bucket_lock_attr);
-		CHKmalloc(b->htable = create_hashtable(7, hash_from_string, key_equals_string, perctileStatDestruct));
+		CHKmalloc(b->htable = create_hashtable(7, hash_from_string, key_equals_string, NULL));
 		CHKmalloc(b->name = ustrdup(name));
+		if (delim) {
+			CHKmalloc(b->delim = ustrdup(delim));
+		} else {
+			CHKmalloc(b->delim = ustrdup("."));
+		}
 		b->perctile_values = perctiles;
 		CHKmalloc(b->perctile_values = calloc(perctilesCount, sizeof(u_int8_t)));
 		b->perctile_values_count = perctilesCount;
@@ -506,6 +614,7 @@ rsRetVal
 perctile_processCnf(struct cnfobj *o) {
 	struct cnfparamvals *pvals;
 	uchar *name = NULL;
+	uchar *delim = NULL;
 	uint8_t *perctiles = NULL;
 	uint32_t perctilesCount = 0;
 	uint64_t windowSize = 0;
@@ -519,9 +628,11 @@ perctile_processCnf(struct cnfobj *o) {
 	for(short i = 0 ; i < modpblk.nParams ; ++i) {
 		if(!pvals[i].bUsed)
 			continue;
-		if(!strcmp(modpblk.descr[i].name, PERCTILE_PARAM_NAME)) {
+		if(!strcmp(modpblk.descr[i].name, PERCTILE_CONF_PARAM_NAME)) {
 			CHKmalloc(name = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL));
-		} else if (!strcmp(modpblk.descr[i].name, PERCTILE_PARAM_PERCENTILES)) {
+		} else if(!strcmp(modpblk.descr[i].name, PERCTILE_CONF_PARAM_DELIM)) {
+			CHKmalloc(delim = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL));
+		} else if (!strcmp(modpblk.descr[i].name, PERCTILE_CONF_PARAM_PERCENTILES)) {
 			perctilesCount = pvals[i].val.d.ar->nmemb;
 			if (perctilesCount) {
 				CHKmalloc(perctiles = calloc(perctilesCount, sizeof(uint32_t)));
@@ -531,7 +642,7 @@ perctile_processCnf(struct cnfobj *o) {
 					free(cstr);
 				}
 			}
-		} else if (!strcmp(modpblk.descr[i].name, PERCTILE_PARAM_WINDOW_SIZE)) {
+		} else if (!strcmp(modpblk.descr[i].name, PERCTILE_CONF_PARAM_WINDOW_SIZE)) {
 			windowSize = pvals[i].val.d.n;
 		} else {
 			dbgprintf("perctile: program error, non-handled "
@@ -540,11 +651,12 @@ perctile_processCnf(struct cnfobj *o) {
 	}
 
 	if (name != NULL) {
-		CHKiRet(perctile_newBucket(name, perctiles, perctilesCount, windowSize));
+		CHKiRet(perctile_newBucket(name, delim, perctiles, perctilesCount, windowSize));
 	}
 
 finalize_it:
 	free(name);
+	free(delim);
 	free(perctiles);
 	cnfparamvalsDestruct(pvals, &modpblk);
 	RETiRet;
@@ -557,7 +669,7 @@ perctile_initCnf(perctile_buckets_t *bkts) {
 	bkts->initialized = 0;
 	bkts->listBuckets = NULL;
 	CHKiRet(statsobj.Construct(&bkts->global_stats));
-	CHKiRet(statsobj.SetOrigin(bkts->global_stats, UCHAR_CONSTANT("perctile")));
+	CHKiRet(statsobj.SetOrigin(bkts->global_stats, UCHAR_CONSTANT("percentile")));
 	CHKiRet(statsobj.SetName(bkts->global_stats, UCHAR_CONSTANT("global")));
 	CHKiRet(statsobj.SetReportingNamespace(bkts->global_stats, UCHAR_CONSTANT("values")));
 	CHKiRet(statsobj.ConstructFinalize(bkts->global_stats));
@@ -597,14 +709,14 @@ perctile_obs(perctile_bucket_t *perctile_bkt, uchar* key, int64_t value) {
 		FINALIZE;
 	}
 	PERCTILE_STATS_LOG("perctile_obs() - bucket name: %s, key: %s, val: %" PRId64 "\n",
-										 perctile_bkt->name, key, value);
+		perctile_bkt->name, key, value);
 
 	CHKiRet(perctile_observe(perctile_bkt, key, value));
 
 finalize_it:
 	if (iRet != RS_RET_OK) {
-		// free pstat
-		assert(0);
+		LogError(0, RS_RET_INTERNAL_ERROR, "perctile_obs(): name: %s, key: %s, val: %" PRId64 "\n",
+			perctile_bkt->name, key, value);
 	}
 	RETiRet;
 }

@@ -1,21 +1,31 @@
 #!/bin/bash
 
 . ${srcdir:=.}/diag.sh init
+DELIMITER='|'
+BUCKETNAME='test_bucket'
+STATNAME='test_stat_name'
+# uncomment to test really long statname
+#STATNAME='123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890'
 generate_conf
 add_conf '
 ruleset(name="stats") {
   action(type="omfile" file="'${RSYSLOG_DYNNAME}'.out.stats.log")
 }
 
-module(load="../plugins/impstats/.libs/impstats" interval="1" severity="7" resetCounters="on" Ruleset="stats" bracketing="on")
+module(load="../plugins/impstats/.libs/impstats" interval="1" severity="7" Ruleset="stats" bracketing="on")
+#module(load="../plugins/impstats/.libs/impstats" format="json" interval="1" severity="7" Ruleset="stats" bracketing="on")
 template(name="outfmt" type="string" string="%$.timestamp% %msg%  val=%$.val%\n")
 
-percentile_stats(name="msg_stats" percentiles=["95", "50", "99"] windowsize="1000")
+percentile_stats(name="'$BUCKETNAME'"
+  percentiles=["95", "50", "99"]
+  windowsize="1000"
+  delimiter="'${DELIMITER}'"
+  )
 
 if $msg startswith " msgnum:" then {
   # test with a small window
   set $.val = field($msg, 58, 2);
-  set $.status = percentile_observe("msg_stats", "testkey", $.val);
+  set $.status = percentile_observe("'$BUCKETNAME'", "'$STATNAME'", $.val);
   action(type="omfile" file=`echo $RSYSLOG_OUT_LOG` template="outfmt")
 }
 '
@@ -33,21 +43,21 @@ wait_for_stats_flush ${RSYSLOG_DYNNAME}.out.stats.log
 
 echo doing shutdown
 shutdown_when_empty
-custom_content_check 'msg_stats_testkey_p95=950' "${RSYSLOG_DYNNAME}.out.stats.log"
-custom_content_check 'msg_stats_testkey_p50=500' "${RSYSLOG_DYNNAME}.out.stats.log"
-custom_content_check 'msg_stats_testkey_p99=990' "${RSYSLOG_DYNNAME}.out.stats.log"
-custom_content_check 'msg_stats_testkey_window_min=1' "${RSYSLOG_DYNNAME}.out.stats.log"
-custom_content_check 'msg_stats_testkey_window_max=1000' "${RSYSLOG_DYNNAME}.out.stats.log"
-custom_content_check 'msg_stats_testkey_window_sum=500500' "${RSYSLOG_DYNNAME}.out.stats.log"
-custom_content_check 'msg_stats_testkey_window_count=1000' "${RSYSLOG_DYNNAME}.out.stats.log"
+custom_content_check "${STATNAME}${DELIMITER}p95=950" "${RSYSLOG_DYNNAME}.out.stats.log"
+custom_content_check "${STATNAME}${DELIMITER}p50=500" "${RSYSLOG_DYNNAME}.out.stats.log"
+custom_content_check "${STATNAME}${DELIMITER}p99=990" "${RSYSLOG_DYNNAME}.out.stats.log"
+custom_content_check "${STATNAME}${DELIMITER}window_min=1" "${RSYSLOG_DYNNAME}.out.stats.log"
+custom_content_check "${STATNAME}${DELIMITER}window_max=1000" "${RSYSLOG_DYNNAME}.out.stats.log"
+custom_content_check "${STATNAME}${DELIMITER}window_sum=500500" "${RSYSLOG_DYNNAME}.out.stats.log"
+custom_content_check "${STATNAME}${DELIMITER}window_count=1000" "${RSYSLOG_DYNNAME}.out.stats.log"
 
-custom_content_check 'msg_stats_testkey_p95=1950' "${RSYSLOG_DYNNAME}.out.stats.log"
-custom_content_check 'msg_stats_testkey_p50=1500' "${RSYSLOG_DYNNAME}.out.stats.log"
-custom_content_check 'msg_stats_testkey_p99=1990' "${RSYSLOG_DYNNAME}.out.stats.log"
+custom_content_check "${STATNAME}${DELIMITER}p95=1950" "${RSYSLOG_DYNNAME}.out.stats.log"
+custom_content_check "${STATNAME}${DELIMITER}p50=1500" "${RSYSLOG_DYNNAME}.out.stats.log"
+custom_content_check "${STATNAME}${DELIMITER}p99=1990" "${RSYSLOG_DYNNAME}.out.stats.log"
 ## historical
-custom_content_check 'msg_stats_testkey_historical_window_min=1' "${RSYSLOG_DYNNAME}.out.stats.log"
-custom_content_check 'msg_stats_testkey_historical_window_max=2000' "${RSYSLOG_DYNNAME}.out.stats.log"
-custom_content_check 'msg_stats_testkey_historical_window_sum=2001000' "${RSYSLOG_DYNNAME}.out.stats.log"
-custom_content_check 'msg_stats_testkey_historical_window_count=2000' "${RSYSLOG_DYNNAME}.out.stats.log"
+custom_content_check "${STATNAME}${DELIMITER}historical_window_min=1" "${RSYSLOG_DYNNAME}.out.stats.log"
+custom_content_check "${STATNAME}${DELIMITER}historical_window_max=2000" "${RSYSLOG_DYNNAME}.out.stats.log"
+custom_content_check "${STATNAME}${DELIMITER}historical_window_sum=2001000" "${RSYSLOG_DYNNAME}.out.stats.log"
+custom_content_check "${STATNAME}${DELIMITER}historical_window_count=2000" "${RSYSLOG_DYNNAME}.out.stats.log"
 
 exit_test
