@@ -334,14 +334,15 @@ perctile_observe(perctile_bucket_t *bkt, uchar* key, int64_t value) {
 		CHKmalloc(pstat->ctrs = calloc(bkt->perctile_values_count, sizeof(perctile_ctr_t)));
 		pstat->perctile_ctrs_count = bkt->perctile_values_count;
 		CHKmalloc(pstat->rb_observed_stats = ringbuf_new(bkt->window_size));
+		pstat->bReported = 0;
 		pthread_rwlock_init(&pstat->stats_lock, NULL);
 
 		// init all stat counters here
 		pthread_rwlock_wrlock(&pstat->stats_lock);
 		pstat->ctrWindowCount = pstat->ctrWindowMax = pstat->ctrWindowSum = 0;
-		pstat->ctrWindowMin = sizeof(pstat->ctrWindowMin);
+		pstat->ctrWindowMin = value;
 		pstat->ctrHistoricalWindowCount = pstat->ctrHistoricalWindowMax =  pstat->ctrHistoricalWindowSum = 0;
-		pstat->ctrHistoricalWindowMin = sizeof(pstat->ctrHistoricalWindowMin);
+		pstat->ctrHistoricalWindowMin = value;
 		pthread_rwlock_unlock(&pstat->stats_lock);
 
 		iRet = initAndAddPerctileMetrics(pstat, bkt, key);
@@ -370,16 +371,19 @@ perctile_observe(perctile_bucket_t *bkt, uchar* key, int64_t value) {
 	// update perctile specific stats
 	pthread_rwlock_wrlock(&pstat->stats_lock);
 	{
-		(pstat->ctrWindowCount)++;
+		if (pstat->bReported) {
+			// reset window values
+			pstat->ctrWindowCount = pstat->ctrWindowSum = 0;
+			pstat->ctrWindowMin = pstat->ctrWindowMax = value;
+			pstat->bReported = 0;
+		}
+		++(pstat->ctrWindowCount);
+		++(pstat->ctrHistoricalWindowCount);
 		pstat->ctrWindowSum += value;
-		assert(value != 0);
-		assert(pstat->ctrWindowMin != 0);
+		pstat->ctrHistoricalWindowSum += value;
 		pstat->ctrWindowMin = min(pstat->ctrWindowMin, value);
-		assert(pstat->ctrWindowMin != 0);
 		pstat->ctrWindowMax = max(pstat->ctrWindowMax, value);
 
-		(pstat->ctrHistoricalWindowCount)++;
-		pstat->ctrHistoricalWindowSum += value;
 		pstat->ctrHistoricalWindowMin = min(pstat->ctrHistoricalWindowMin, value);
 		pstat->ctrHistoricalWindowMax = max(pstat->ctrHistoricalWindowMax, value);
 	}
@@ -425,9 +429,8 @@ static rsRetVal report_perctile_stats(perctile_bucket_t* pbkt) {
 			perctile_stat_t *perc_stat = hashtable_iterator_value(itr);
 			// ringbuffer read
 			size_t count = ringbuf_read_to_end(perc_stat->rb_observed_stats, buf, pbkt->window_size);
-			perc_stat->ctrWindowCount = 0;
 			if (!count) {
-				FINALIZE;
+				continue;
 			}
 			PERCTILE_STATS_LOG("read %zu values\n", count);
 			// calculate the p95 based on the
@@ -462,6 +465,7 @@ static rsRetVal report_perctile_stats(perctile_bucket_t* pbkt) {
 				PERCTILE_STATS_LOG("report_perctile_stats() - index: %d, perctile stat [%s, %d, %llu]",
 					index, perc_stat->name, pctr->percentile, pctr->ctr_perctile_stat);
 			}
+			perc_stat->bReported = 1;
 		} while (hashtable_iterator_advance(itr));
 	}
 

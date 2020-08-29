@@ -32,35 +32,29 @@ struct perctile_ctr_s {
 
 struct perctile_stat_s {
 	uchar name[128];
+	sbool bReported;
 	struct ringbuf_s *rb_observed_stats;
-
 	// array of requested perctile to track
 	struct perctile_ctr_s *ctrs;
 	size_t perctile_ctrs_count;
 
 	pthread_rwlock_t stats_lock;
-
 	intctr_t ctrWindowCount;
 	ctr_t *refCtrWindowCount;
-
 	intctr_t ctrWindowMin;
 	ctr_t *refCtrWindowMin;
-
 	intctr_t ctrWindowMax;
 	ctr_t *refCtrWindowMax;
-
 	intctr_t ctrWindowSum;
 	ctr_t *refCtrWindowSum;
-
-	intctr_t ctrHistoricalWindowCount;
-	ctr_t *refCtrHistoricalWindowCount;
-
 	intctr_t ctrHistoricalWindowMin;
 	ctr_t *refCtrHistoricalWindowMin;
-
 	intctr_t ctrHistoricalWindowMax;
 	ctr_t *refCtrHistoricalWindowMax;
 
+	/* TODO: These need to be limited to a period or they will inevitably overflow - daily? */
+	intctr_t ctrHistoricalWindowCount;
+	ctr_t *refCtrHistoricalWindowCount;
 	intctr_t ctrHistoricalWindowSum;
 	ctr_t *refCtrHistoricalWindowSum;
 };
@@ -68,7 +62,6 @@ struct perctile_stat_s {
 struct perctile_bucket_s {
 	uchar *name;
 	uchar *delim;
-
 	// lock for entire bucket
 	pthread_rwlock_t lock;
 	struct hashtable *htable;
@@ -78,9 +71,7 @@ struct perctile_bucket_s {
 	ctr_t *pNewKeyAddCtr;
 	STATSCOUNTER_DEF(ctrOpsOverflow, mutCtrOpsOverflow);
 	ctr_t *pOpsOverflowCtr;
-
 	u_int32_t window_size;
-
 	// These percentile values apply to all perctile stats in this bucket.
 	uint8_t *perctile_values;
 	size_t perctile_values_count;

@@ -54,6 +54,11 @@ custom_content_check "${STATNAME}${DELIMITER}window_count=1000" "${RSYSLOG_DYNNA
 custom_content_check "${STATNAME}${DELIMITER}p95=1950" "${RSYSLOG_DYNNAME}.out.stats.log"
 custom_content_check "${STATNAME}${DELIMITER}p50=1500" "${RSYSLOG_DYNNAME}.out.stats.log"
 custom_content_check "${STATNAME}${DELIMITER}p99=1990" "${RSYSLOG_DYNNAME}.out.stats.log"
+custom_content_check "${STATNAME}${DELIMITER}window_min=1001" "${RSYSLOG_DYNNAME}.out.stats.log"
+custom_content_check "${STATNAME}${DELIMITER}window_max=2000" "${RSYSLOG_DYNNAME}.out.stats.log"
+custom_content_check "${STATNAME}${DELIMITER}window_sum=1500500" "${RSYSLOG_DYNNAME}.out.stats.log"
+custom_content_check "${STATNAME}${DELIMITER}window_count=1000" "${RSYSLOG_DYNNAME}.out.stats.log"
+
 ## historical
 custom_content_check "${STATNAME}${DELIMITER}historical_window_min=1" "${RSYSLOG_DYNNAME}.out.stats.log"
 custom_content_check "${STATNAME}${DELIMITER}historical_window_max=2000" "${RSYSLOG_DYNNAME}.out.stats.log"
