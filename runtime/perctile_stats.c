@@ -29,6 +29,7 @@
 #include "perctile_stats.h"
 #include "hashtable_itr.h"
 #include "perctile_ringbuf.h"
+#include "datetime.h"
 
 #include <stdio.h>
 #include <pthread.h>
@@ -45,11 +46,13 @@
 /* definitions for objects we access */
 DEFobjStaticHelpers
 DEFobjCurrIf(statsobj)
+DEFobjCurrIf(datetime)
 
 #define PERCTILE_CONF_PARAM_NAME        "name"
 #define PERCTILE_CONF_PARAM_PERCENTILES "percentiles"
 #define PERCTILE_CONF_PARAM_WINDOW_SIZE "windowsize"
 #define PERCTILE_CONF_PARAM_DELIM       "delimiter"
+#define PERCTILE_CONF_PARAM_HISTORICAL_INTERVAL "historicalinterval"
 
 #define PERCTILE_MAX_BUCKET_NS_METRIC_LENGTH  128
 #define PERCTILE_METRIC_NAME_SEPARATOR        '.'
@@ -59,6 +62,7 @@ static struct cnfparamdescr modpdescr[] = {
 	{ PERCTILE_CONF_PARAM_DELIM, eCmdHdlrString, 0},
 	{ PERCTILE_CONF_PARAM_PERCENTILES, eCmdHdlrArray, 0},
 	{ PERCTILE_CONF_PARAM_WINDOW_SIZE, eCmdHdlrPositiveInt, 0},
+	{ PERCTILE_CONF_PARAM_HISTORICAL_INTERVAL, eCmdHdlrPositiveInt, 0},
 };
 
 static struct cnfparamblk modpblk = {
@@ -72,6 +76,7 @@ perctileClassInit(void) {
 	DEFiRet;
 	CHKiRet(objGetObjInterface(&obj));
 	CHKiRet(objUse(statsobj, CORE_COMPONENT));
+	CHKiRet(objUse(datetime, CORE_COMPONENT));
 finalize_it:
 	RETiRet;
 }
@@ -323,6 +328,8 @@ perctile_observe(perctile_bucket_t *bkt, uchar* key, int64_t value) {
 	uint8_t lock_initialized = 0;
 	uchar* hash_key = NULL;
 	DEFiRet;
+	time_t now;
+	datetime.GetTime(&now);
 
 	pthread_rwlock_wrlock(&bkt->lock);
 	lock_initialized = 1;
@@ -339,6 +346,7 @@ perctile_observe(perctile_bucket_t *bkt, uchar* key, int64_t value) {
 
 		// init all stat counters here
 		pthread_rwlock_wrlock(&pstat->stats_lock);
+		pstat->historical_window_start_time = now;
 		pstat->ctrWindowCount = pstat->ctrWindowMax = pstat->ctrWindowSum = 0;
 		pstat->ctrWindowMin = value;
 		pstat->ctrHistoricalWindowCount = pstat->ctrHistoricalWindowMax =  pstat->ctrHistoricalWindowSum = 0;
@@ -376,6 +384,12 @@ perctile_observe(perctile_bucket_t *bkt, uchar* key, int64_t value) {
 			pstat->ctrWindowCount = pstat->ctrWindowSum = 0;
 			pstat->ctrWindowMin = pstat->ctrWindowMax = value;
 			pstat->bReported = 0;
+		}
+		if (now >= (pstat->historical_window_start_time + bkt->historical_interval)) {
+			// reset historical values
+			pstat->ctrHistoricalWindowCount = pstat->ctrHistoricalWindowSum = 0;
+			pstat->ctrHistoricalWindowMin = pstat->ctrHistoricalWindowMax = value;
+			pstat->historical_window_start_time = now;
 		}
 		++(pstat->ctrWindowCount);
 		++(pstat->ctrHistoricalWindowCount);
@@ -549,7 +563,7 @@ finalize_it:
 /* Create new perctile bucket, and add it to our list of perctile buckets.
 */
 static rsRetVal
-perctile_newBucket(const uchar *name, const uchar *delim, uint8_t *perctiles, uint32_t perctilesCount, uint32_t windowSize) {
+perctile_newBucket(const uchar *name, const uchar *delim, uint8_t *perctiles, uint32_t perctilesCount, uint32_t windowSize, uint32_t historicalInterval) {
 	perctile_buckets_t *bkts;
 	perctile_bucket_t* b = NULL;
 	pthread_rwlockattr_t bucket_lock_attr;
@@ -575,6 +589,7 @@ perctile_newBucket(const uchar *name, const uchar *delim, uint8_t *perctiles, ui
 		b->perctile_values_count = perctilesCount;
 		memcpy(b->perctile_values, perctiles, perctilesCount * sizeof(uint8_t));
 		b->window_size = windowSize;
+		b->historical_interval = historicalInterval;
 		b->next = NULL;
 		PERCTILE_STATS_LOG("perctile_newBucket: create new bucket for %s, with windowsize: %d,  values_count: %zu\n",
 				b->name, b->window_size, b->perctile_values_count);
@@ -622,6 +637,7 @@ perctile_processCnf(struct cnfobj *o) {
 	uint8_t *perctiles = NULL;
 	uint32_t perctilesCount = 0;
 	uint64_t windowSize = 0;
+	uint64_t historicalInterval = 86400; /* seconds in a day */
 	DEFiRet;
 
 	pvals = nvlstGetParams(o->nvlst, &modpblk, NULL);
@@ -636,6 +652,8 @@ perctile_processCnf(struct cnfobj *o) {
 			CHKmalloc(name = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL));
 		} else if(!strcmp(modpblk.descr[i].name, PERCTILE_CONF_PARAM_DELIM)) {
 			CHKmalloc(delim = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL));
+		} else if(!strcmp(modpblk.descr[i].name, PERCTILE_CONF_PARAM_HISTORICAL_INTERVAL)) {
+			historicalInterval = pvals[i].val.d.n;
 		} else if (!strcmp(modpblk.descr[i].name, PERCTILE_CONF_PARAM_PERCENTILES)) {
 			perctilesCount = pvals[i].val.d.ar->nmemb;
 			if (perctilesCount) {
@@ -655,7 +673,7 @@ perctile_processCnf(struct cnfobj *o) {
 	}
 
 	if (name != NULL) {
-		CHKiRet(perctile_newBucket(name, delim, perctiles, perctilesCount, windowSize));
+		CHKiRet(perctile_newBucket(name, delim, perctiles, perctilesCount, windowSize, historicalInterval));
 	}
 
 finalize_it:

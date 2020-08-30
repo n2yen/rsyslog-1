@@ -33,6 +33,7 @@ struct perctile_ctr_s {
 struct perctile_stat_s {
 	uchar name[128];
 	sbool bReported;
+	time_t historical_window_start_time;
 	struct ringbuf_s *rb_observed_stats;
 	// array of requested perctile to track
 	struct perctile_ctr_s *ctrs;
@@ -72,6 +73,7 @@ struct perctile_bucket_s {
 	STATSCOUNTER_DEF(ctrOpsOverflow, mutCtrOpsOverflow);
 	ctr_t *pOpsOverflowCtr;
 	u_int32_t window_size;
+	u_int32_t historical_interval;
 	// These percentile values apply to all perctile stats in this bucket.
 	uint8_t *perctile_values;
 	size_t perctile_values_count;
