@@ -938,6 +938,7 @@ endif # ENABLE_IMDOCKER
 if ENABLE_IMHTTP
 TESTS += \
 	imhttp-post-payload.sh \
+	imhttp-post-payload-basic-auth.sh \
 	imhttp-post-payload-large.sh \
 	imhttp-post-payload-multi.sh \
 	imhttp-post-payload-multi-lf.sh \
@@ -946,6 +947,7 @@ TESTS += \
 if HAVE_VALGRIND
 TESTS +=  \
 	imhttp-post-payload-vg.sh \
+	imhttp-post-payload-basic-auth-vg.sh \
 	imhttp-post-payload-large-vg.sh \
 	imhttp-post-payload-multi-vg.sh \
 	imhttp-post-payload-multi-lf-vg.sh \
