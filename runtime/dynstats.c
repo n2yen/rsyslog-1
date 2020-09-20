@@ -82,12 +82,12 @@ static rsRetVal dynstats_addNewCtr(dynstats_bucket_t *b, const uchar* metric, ui
 static int getFullStateFileName(dynstats_bucket_t *b, uchar* pszstatefile, uchar* pszout, int buflen);
 static uchar* getStateFileName(const dynstats_bucket_t *const pbucket,
 		uchar *const __restrict__ buf, const size_t lenbuf) ATTR_NONNULL(1, 2);
-static rsRetVal persistBucketState(dynstats_bucket_t *b) ATTR_NONNULL(1);
-static rsRetVal initFileWriteWorker(void);
+static rsRetVal persistBucketState(dynstats_bucket_t *b, sbool useWorker) ATTR_NONNULL(1);
+static rsRetVal initFileWriteWorker(dynstats_buckets_t *bkts);
 static rsRetVal enqueueFileWriteTask(dynstats_bucket_t *b, const char* file_name, const char* content);
-static void startFileWriteWorker(void);
-static void stopFileWriteWorker(void);
-static void destroyFileWriteWorker(void);
+static void startFileWriteWorker(dynstats_buckets_t *bkts);
+static void stopFileWriteWorker(dynstats_buckets_t *bkts);
+static void destroyFileWriteWorker(dynstats_buckets_t *bkts);
 
 rsRetVal
 dynstatsClassInit(void) {
@@ -95,10 +95,6 @@ dynstatsClassInit(void) {
 	CHKiRet(objGetObjInterface(&obj));
 	CHKiRet(objUse(statsobj, CORE_COMPONENT));
 	CHKiRet(objUse(datetime, CORE_COMPONENT));
-	/* TODO: consider if this should be moved to post configuration */
-	initFileWriteWorker();
-	startFileWriteWorker();
-
 finalize_it:
 	RETiRet;
 }
@@ -137,12 +133,15 @@ dynstats_destroyBucket(dynstats_bucket_t* b) {
 
 	bkts = &loadConf->dynstats_buckets;
 
-	if(b->persist_state_interval) {
-		persistBucketState(b);
+	if(b->persist_state_write_count_interval) {
+		persistBucketState(b, 0);
 	}
 	pthread_rwlock_wrlock(&b->lock);
 	dynstats_destroyCounters(b);
 	dynstats_destroyCountersIn(b, b->survivor_table, b->survivor_ctrs);
+	statsobj.DestructCounter(b->stats, b->pCtrFlushedBytes);
+	statsobj.DestructCounter(b->stats, b->pCtrFlushed);
+	statsobj.DestructCounter(b->stats, b->pCtrFlushedErrors);
 	statsobj.Destruct(&b->stats);
 	free(b->name);
 	free(b->state_file_directory);
@@ -255,7 +254,7 @@ dynstats_rebuildSurvivorTable(dynstats_bucket_t *b) {
 	htable *new_table = NULL;
 	size_t htab_sz;
 	DEFiRet;
-	
+
 	htab_sz = (size_t) (DYNSTATS_HASHTABLE_SIZE_OVERPROVISIONING * b->maxCardinality + 1);
 	if (b->table == NULL) {
 		CHKmalloc(survivor_table = create_hashtable(htab_sz, hash_from_string, key_equals_string,
@@ -337,19 +336,26 @@ dynstats_initNewBucketStats(dynstats_bucket_t *b) {
 	CHKiRet(statsobj.SetName(b->stats, b->name));
 	CHKiRet(statsobj.SetReportingNamespace(b->stats, UCHAR_CONSTANT("values")));
 
-	char bucket_stat_name[256];
-	size_t bufsize = sizeof(bucket_stat_name);
-	snprintf(bucket_stat_name, bufsize, "%s_%s", b->name, "flushed_bytes");
-	CHKiRet(statsobj.AddCounter(b->stats, (uchar*)bucket_stat_name,
-		ctrType_Int, CTR_FLAG_NONE, &b->flushedBytes));
+	char bucket_stat_name[512];
+	int bufsize = sizeof(bucket_stat_name);
+	int rc = 0;
+	rc = snprintf(bucket_stat_name, bufsize, "%s_%s", b->name, "flushed_bytes");
+	assert(rc < 0 || rc <= bufsize);
+	STATSCOUNTER_INIT(b->ctrFlushedBytes, b->mutCtrFlushedBytes);
+	CHKiRet(statsobj.AddManagedCounter(b->stats, (uchar*)bucket_stat_name,
+		ctrType_IntCtr, CTR_FLAG_RESETTABLE, &b->ctrFlushedBytes, &b->pCtrFlushedBytes, 0));
 
-	snprintf(bucket_stat_name, bufsize, "%s_%s", b->name, "flushed_counts");
-	CHKiRet(statsobj.AddCounter(b->stats, (uchar*)bucket_stat_name,
-		ctrType_Int, CTR_FLAG_NONE, &b->flushedCount));
+	rc = snprintf(bucket_stat_name, bufsize, "%s_%s", b->name, "flushed_counts");
+	assert(rc < 0 || rc <= bufsize);
+	STATSCOUNTER_INIT(b->ctrFlushed, b->mutCtrFlushed);
+	CHKiRet(statsobj.AddManagedCounter(b->stats, (uchar*)bucket_stat_name,
+		ctrType_IntCtr, CTR_FLAG_RESETTABLE, &b->ctrFlushed, &b->pCtrFlushed, 0));
 
-	snprintf(bucket_stat_name, bufsize, "%s_%s", b->name, "flush_errors");
-	CHKiRet(statsobj.AddCounter(b->stats, (uchar*)bucket_stat_name,
-		ctrType_Int, CTR_FLAG_NONE, &b->flushedErrors));
+	rc = snprintf(bucket_stat_name, bufsize, "%s_%s", b->name, "flush_errors");
+	assert(rc < 0 || rc <= bufsize);
+	STATSCOUNTER_INIT(b->ctrFlushedErrors, b->mutCtrFlushedErrors);
+	CHKiRet(statsobj.AddManagedCounter(b->stats, (uchar*)bucket_stat_name,
+		ctrType_IntCtr, CTR_FLAG_RESETTABLE, &b->ctrFlushedErrors, &b->pCtrFlushedErrors, 0));
 
 	statsobj.SetReadNotifier(b->stats, dynstats_readCallback, b);
 	CHKiRet(statsobj.ConstructFinalize(b->stats));
@@ -361,11 +367,12 @@ finalize_it:
 /* try to open a file which has a state file. If the state file does not
  * exist or cannot be read, an error is returned.
  */
-static rsRetVal ATTR_NONNULL(1) openFileWithStateFile(dynstats_bucket_t *b) {
+static rsRetVal ATTR_NONNULL(1) loadPersistedState(dynstats_bucket_t *b) {
 	DEFiRet;
 	struct stat stat_buf;
 	uchar statefile[MAXFNAME];
 	uchar state_file_path[MAXFNAME];
+	json_object *json_obj = NULL;
 
 	uchar *const state_file_name = getStateFileName(b, statefile, sizeof(statefile));
 	assert(state_file_name);
@@ -377,14 +384,14 @@ static rsRetVal ATTR_NONNULL(1) openFileWithStateFile(dynstats_bucket_t *b) {
 	if(stat((char*) state_file_path, &stat_buf) == -1) {
 		LogMsg(0, RS_RET_FILE_NOT_FOUND, LOG_INFO,
 				"dyn_stats: warning state file doesn't exist: '%s'", state_file_path);
-		FINALIZE;
+		ABORT_FINALIZE(RS_RET_FILE_NOT_FOUND);
 	}
 
-	json_object *json_obj = fjson_object_from_file((const char*)state_file_path);
+	json_obj = fjson_object_from_file((const char*)state_file_path);
 	if (!json_obj) {
 		LogMsg(0, RS_RET_JSON_UNUSABLE, LOG_INFO,
 				"dyn_stats: error couldn't read json from file.");
-		FINALIZE;
+		ABORT_FINALIZE(RS_RET_JSON_UNUSABLE);
 	}
 
 	/* expected json format
@@ -403,9 +410,11 @@ static rsRetVal ATTR_NONNULL(1) openFileWithStateFile(dynstats_bucket_t *b) {
 			dynstats_addNewCtr(b, metric, 0, val);
 		}
 	}
-	json_object_put(json_obj);
 
 finalize_it:
+	if (json_obj) {
+		json_object_put(json_obj);
+	}
 	RETiRet;
 }
 
@@ -413,7 +422,7 @@ static rsRetVal
 dynstats_openStateFile(dynstats_bucket_t *b) {
 	DEFiRet;
 
-	CHKiRet(openFileWithStateFile(b));
+	CHKiRet(loadPersistedState(b));
 
 finalize_it:
 	RETiRet;
@@ -438,8 +447,8 @@ dynstats_newBucket(const uchar* name, uint8_t resettable, uint32_t maxCardinalit
 		b->resettable = resettable;
 		b->maxCardinality = maxCardinality;
 		b->unusedMetricLife = 1000 * unusedMetricLife;
-		b->persist_state_interval = persistStateInterval;
-		b->persist_state_time_interval = persistStateTimeInterval;
+		b->persist_state_write_count_interval = persistStateInterval;
+		b->persist_state_interval_secs = persistStateTimeInterval;
 		b->n_updates = 0;
 		CHKmalloc(b->name = ustrdup(name));
 		if (stateFileDirectory) {
@@ -462,10 +471,16 @@ dynstats_newBucket(const uchar* name, uint8_t resettable, uint32_t maxCardinalit
 
 		CHKiRet(dynstats_addBucketMetrics(bkts, b, name));
 
-		if (b && (b->persist_state_interval || b->persist_state_time_interval)) {
+		if (b && (b->persist_state_write_count_interval || b->persist_state_interval_secs)) {
 			time_t now;
-			dynstats_openStateFile(b);
-			datetime.GetTime(&now);
+			rsRetVal rc = dynstats_openStateFile(b);
+			if (rc != RS_RET_OK) {
+				LogMsg(0, rc, LOG_INFO, "dynstats: openStateFile failed - "
+				"there should be messages before this one with the reason.\n");
+			}
+			if (datetime.GetTime(&now) == -1) {
+				ABORT_FINALIZE(RS_RET_INVLD_TIME);
+			}
 			b->persist_expiration_time = now + persistStateTimeInterval;
 		}
 
@@ -487,11 +502,11 @@ finalize_it:
 		if (metric_count_mutex_initialized) {
 			pthread_mutex_destroy(&b->mutMetricCount);
 		}
-		if (lock_initialized) {
-			pthread_rwlock_destroy(&b->lock);
-		}
 		if (b != NULL) {
 			dynstats_destroyBucket(b);
+		}
+		if (lock_initialized) {
+			pthread_rwlock_destroy(&b->lock);
 		}
 	}
 	RETiRet;
@@ -564,6 +579,8 @@ dynstats_initCnf(dynstats_buckets_t *bkts) {
 	pthread_rwlock_init(&bkts->lock, NULL);
 
 	bkts->initialized = 1;
+	initFileWriteWorker(bkts);
+	startFileWriteWorker(bkts);
 
 finalize_it:
 	if (iRet != RS_RET_OK) {
@@ -579,6 +596,8 @@ dynstats_destroyAllBuckets(void) {
 	bkts = &loadConf->dynstats_buckets;
 	if (bkts->initialized) {
 		pthread_rwlock_wrlock(&bkts->lock);
+		stopFileWriteWorker(bkts);
+		destroyFileWriteWorker(bkts);
 		while(1) {
 			b = bkts->list;
 			if (b == NULL) {
@@ -592,10 +611,6 @@ dynstats_destroyAllBuckets(void) {
 		pthread_rwlock_unlock(&bkts->lock);
 		pthread_rwlock_destroy(&bkts->lock);
 	}
-
-	/* TODO: destroy bg-thread here for now, move this into an class exit place */
-	stopFileWriteWorker();
-	destroyFileWriteWorker();
 }
 
 dynstats_bucket_t *
@@ -649,9 +664,11 @@ finalize_it:
 #endif
 /*
  *	Helper function adapted from imfile of the same name - possible candidate for refactor.
+ *	Updates configured state file with the state of the specified bucket
  */
-static rsRetVal ATTR_NONNULL()
+static rsRetVal ATTR_NONNULL(1)
 writeStateFile(dynstats_bucket_t *b, const char *file_name, const char *content) {
+	assert(b);
 	const size_t toWrite = strlen(content);
 	ssize_t w = 0;
 	DEFiRet;
@@ -663,6 +680,7 @@ writeStateFile(dynstats_bucket_t *b, const char *file_name, const char *content)
 		ABORT_FINALIZE(RS_RET_IO_ERROR);
 	}
 
+	/* note: write is immediately sync'd */
 	w = write(fd, content, toWrite);
 	if(w != (ssize_t) toWrite) {
 		LogError(errno, RS_RET_IO_ERROR, "dynstats: partial write to state file '%s' "
@@ -673,16 +691,13 @@ writeStateFile(dynstats_bucket_t *b, const char *file_name, const char *content)
 	}
 
 finalize_it:
-	/* TODO: revisit - seems wasteful to use the bucket lock for this */
-	pthread_rwlock_wrlock(&b->lock);
 	if (iRet == RS_RET_IO_ERROR) {
-		b->flushedErrors++;
+		STATSCOUNTER_INC(b->ctrFlushedErrors, b->mutCtrFlushedErrors);
 	}
 	if (w != -1) {
-		b->flushedBytes += w;
-		b->flushedCount++;
+		STATSCOUNTER_ADD(b->ctrFlushedBytes, b->mutCtrFlushedBytes, w);
+		STATSCOUNTER_INC(b->ctrFlushed, b->mutCtrFlushed);
 	}
-	pthread_rwlock_unlock(&b->lock);
 
 	if(fd >= 0) {
 		close(fd);
@@ -744,7 +759,7 @@ getStateFileName(const dynstats_bucket_t *const pbucket,
  * metric bucket counters
  */
 static rsRetVal ATTR_NONNULL(1)
-persistBucketState(dynstats_bucket_t *b) {
+persistBucketState(dynstats_bucket_t *b, sbool useWorker) {
 	DEFiRet;
 	uchar statefile[MAXFNAME];
 	uchar statefname[MAXFNAME];
@@ -778,7 +793,11 @@ persistBucketState(dynstats_bucket_t *b) {
 	}
 
 	const char *jstr =  json_object_to_json_string_ext(json, JSON_C_TO_STRING_PLAIN);
-	CHKiRet(enqueueFileWriteTask(b, (const char*)statefname, jstr));
+	if (useWorker) {
+		CHKiRet(enqueueFileWriteTask(b, (const char*)statefname, jstr));
+	} else {
+		writeStateFile(b, (const char*)statefname, jstr);
+	}
 
 finalize_it:
 	if(iRet != RS_RET_OK) {
@@ -787,7 +806,9 @@ finalize_it:
 				"startup. Is WorkDirectory set?",
 				statefname);
 	}
-	json_object_put(json);
+	if (json) {
+		json_object_put(json);
+	}
 
 	RETiRet;
 }
@@ -884,11 +905,10 @@ finalize_it:
 static sbool dynstats_shouldPersist(dynstats_bucket_t *b, time_t now) {
 	sbool shouldPersist = FALSE;
 	pthread_rwlock_rdlock(&b->lock);
-	if( (b->persist_state_interval > 0 && ++b->n_updates >= b->persist_state_interval) ||
-			(b->persist_expiration_time && now >= b->persist_expiration_time) )
-	{
-		shouldPersist = TRUE;
-	}
+	shouldPersist =
+		((b->persist_state_write_count_interval > 0 &&
+			++b->n_updates >= b->persist_state_write_count_interval) ||
+			(b->persist_expiration_time && now >= b->persist_expiration_time));
 	pthread_rwlock_unlock(&b->lock);
 	return shouldPersist;
 }
@@ -924,14 +944,15 @@ dynstats_inc(dynstats_bucket_t *b, uchar* metric) {
 	time_t now;
 	datetime.GetTime(&now);
 	if (dynstats_shouldPersist(b, now)) {
-		/* TODO: suggested to be refactored into bg thread */
-		persistBucketState(b);
-		if (b->persist_state_interval) {
+		pthread_rwlock_rdlock(&b->lock);
+		persistBucketState(b, 1);
+		if (b->persist_state_write_count_interval) {
 			b->n_updates = 0;
 		}
-		if (b->persist_state_time_interval) {
-			b->persist_expiration_time = now + b->persist_state_time_interval;
+		if (b->persist_state_interval_secs) {
+			b->persist_expiration_time = now + b->persist_state_interval_secs;
 		}
+		pthread_rwlock_unlock(&b->lock);
 	}
 
 finalize_it:
@@ -947,10 +968,6 @@ finalize_it:
 	RETiRet;
 }
 
-static struct wrkrInfo_s {
-	pthread_t tid;	/* the worker's thread ID */
-} wrkrInfo;
-
 typedef struct file_write_entry_s {
 	STAILQ_ENTRY(file_write_entry_s) link;
 	const char* name;
@@ -958,128 +975,129 @@ typedef struct file_write_entry_s {
 	dynstats_bucket_t *bucket;
 } file_write_entry_t;
 
-typedef struct file_write_queue_s {
-	STAILQ_HEAD(head, file_write_entry_s) q;
-	STATSCOUNTER_DEF(ctrEnq, mutCtrEnq);
-	int size;
-	int ctrMaxSz;
-	statsobj_t *stats;
-	pthread_mutex_t mut;
-	pthread_cond_t wakeup_worker;
-} file_write_queue_t;
-
-static file_write_queue_t work_q;
-static int wrkrRunning;
-
 
 static void
 processWorkItem(file_write_entry_t *task) {
 	// write out the file
-	DBGPRINTF("dynstats: worker processing - '%s', '%s'\n", task->name, task->content);
+	DBGPRINTF("dynstats: worker processing - '%s', '%.100s'\n", task->name, task->content);
 	writeStateFile(task->bucket, task->name, task->content);
 }
 
-static void *
+static void
+destroyFileWriteTask(file_write_entry_t *task)
+{
+	free((void *)task->name);
+	free((void *)task->content);
+	free(task);
+}
+
+static void*
 fileWriteWorker(void* data) {
-	struct wrkrInfo_s *me = (struct wrkrInfo_s*) data;
-	pthread_mutex_lock(&work_q.mut);
-	++wrkrRunning;
-	pthread_mutex_unlock(&work_q.mut);
+	dynstats_buckets_t *bkts = (dynstats_buckets_t *)data;
+	if (!bkts) {
+		return NULL;
+	}
+
+	pthread_mutex_lock(&bkts->work_q.mut);
+	++bkts->wrkrRunning;
+	pthread_mutex_unlock(&bkts->work_q.mut);
 
 	file_write_entry_t *task;
 	while(1) {
 		task = NULL;
-		pthread_mutex_lock(&work_q.mut);
-		if (work_q.size == 0) {
-			--wrkrRunning;
-			//if (glbl.GetGlobalInputTermState() != 0) {
-			// TODO: clean this up
-			if(ATOMIC_FETCH_32BIT(&bTerminateInputs, &mutTerminateInputs) != 0) {
-				pthread_mutex_unlock(&work_q.mut);
+		pthread_mutex_lock(&bkts->work_q.mut);
+		if (bkts->work_q.size == 0) {
+			--bkts->wrkrRunning;
+			if (bkts->wkrTermState == 1) {
+				pthread_mutex_unlock(&bkts->work_q.mut);
 				break;
 			} else {
 				DBGPRINTF("dynstats: worker %llu waiting on new work items\n",
-					(unsigned long long) me->tid);
-				pthread_cond_wait(&work_q.wakeup_worker, &work_q.mut);
-				DBGPRINTF("dynstats: worker %llu awoken\n", (unsigned long long) me->tid);
+					(unsigned long long) bkts->wrkrInfo.tid);
+				pthread_cond_wait(&bkts->work_q.wakeup_worker, &bkts->work_q.mut);
+				DBGPRINTF("dynstats: worker %llu awoken\n", (unsigned long long) bkts->wrkrInfo.tid);
 			}
-			++wrkrRunning;
+			++bkts->wrkrRunning;
 		}
-		if (work_q.size> 0) {
-			task = STAILQ_FIRST(&work_q.q);
-			STAILQ_REMOVE_HEAD(&work_q.q, link);
-			work_q.size--;
+		if (bkts->work_q.size > 0) {
+			task = STAILQ_FIRST(&bkts->work_q.q);
+			STAILQ_REMOVE_HEAD(&bkts->work_q.q, link);
+			bkts->work_q.size--;
 		}
-		pthread_mutex_unlock(&work_q.mut);
+		pthread_mutex_unlock(&bkts->work_q.mut);
 
 		if (task != NULL) {
 			processWorkItem(task);
-			free((void*)task->name);
-			free((void*)task->content);
-			free(task);
+			destroyFileWriteTask(task);
 		}
 	}
 	return NULL;
 }
 
 static rsRetVal
-initFileWriteWorker(void) {
+initFileWriteWorker(dynstats_buckets_t *bkts) {
 	DEFiRet;
-	CHKiConcCtrl(pthread_mutex_init(&work_q.mut, NULL));
-	CHKiConcCtrl(pthread_cond_init(&work_q.wakeup_worker, NULL));
-	STAILQ_INIT(&work_q.q);
-	work_q.size = 0;
-	work_q.ctrMaxSz = 0;
-	CHKiRet(statsobj.Construct(&work_q.stats));
-	CHKiRet(statsobj.SetName(work_q.stats, (uchar*) "file-write-worker"));
-	CHKiRet(statsobj.SetOrigin(work_q.stats, (uchar*) "dynstats"));
-	STATSCOUNTER_INIT(work_q.ctrEnq, work_q.mutCtrEnq);
-	CHKiRet(statsobj.AddCounter(work_q.stats, UCHAR_CONSTANT("enqueued"),
-								ctrType_IntCtr, CTR_FLAG_RESETTABLE, &work_q.ctrEnq));
-	CHKiRet(statsobj.AddCounter(work_q.stats, UCHAR_CONSTANT("maxqsize"),
-								ctrType_Int, CTR_FLAG_NONE, &work_q.ctrMaxSz));
-	CHKiRet(statsobj.ConstructFinalize(work_q.stats));
+	CHKiConcCtrl(pthread_mutex_init(&bkts->work_q.mut, NULL));
+	CHKiConcCtrl(pthread_cond_init(&bkts->work_q.wakeup_worker, NULL));
+	STAILQ_INIT(&bkts->work_q.q);
+	bkts->work_q.size = 0;
+	bkts->work_q.ctrMaxSz = 0;
+	CHKiRet(statsobj.Construct(&bkts->work_q.stats));
+	CHKiRet(statsobj.SetName(bkts->work_q.stats, (uchar*) "file-write-worker"));
+	CHKiRet(statsobj.SetOrigin(bkts->work_q.stats, (uchar*) "dynstats"));
+	STATSCOUNTER_INIT(bkts->work_q.ctrEnq, bkts->work_q.mutCtrEnq);
+	CHKiRet(statsobj.AddCounter(bkts->work_q.stats, UCHAR_CONSTANT("enqueued"),
+		ctrType_IntCtr, CTR_FLAG_RESETTABLE, &bkts->work_q.ctrEnq));
+	CHKiRet(statsobj.AddCounter(bkts->work_q.stats, UCHAR_CONSTANT("maxqsize"),
+		ctrType_Int, CTR_FLAG_NONE, &bkts->work_q.ctrMaxSz));
+	CHKiRet(statsobj.ConstructFinalize(bkts->work_q.stats));
 finalize_it:
 	RETiRet;
 }
 
-static void
-destroyFileWriteWorker(void) {
+static void ATTR_NONNULL(1)
+destroyFileWriteWorker(dynstats_buckets_t *bkts) {
 	file_write_entry_t *task;
-	if (work_q.stats != NULL) {
-		statsobj.Destruct(&work_q.stats);
+	if (bkts->work_q.stats != NULL) {
+		statsobj.Destruct(&bkts->work_q.stats);
 	}
-	pthread_mutex_lock(&work_q.mut);
-	while (!STAILQ_EMPTY(&work_q.q)) {
-		task = STAILQ_FIRST(&work_q.q);
-		STAILQ_REMOVE_HEAD(&work_q.q, link);
+	pthread_mutex_lock(&bkts->work_q.mut);
+	while (!STAILQ_EMPTY(&bkts->work_q.q)) {
+		task = STAILQ_FIRST(&bkts->work_q.q);
+		STAILQ_REMOVE_HEAD(&bkts->work_q.q, link);
 		LogError(0, RS_RET_INTERNAL_ERROR, "dynstats: discarded enqueued io-work to allow shutdown "
 								"- ignored");
-		free(task);
+		destroyFileWriteTask(task);
 	}
-	work_q.size = 0;
-	pthread_mutex_unlock(&work_q.mut);
-	pthread_cond_destroy(&work_q.wakeup_worker);
-	pthread_mutex_destroy(&work_q.mut);
+	bkts->work_q.size = 0;
+	pthread_mutex_unlock(&bkts->work_q.mut);
+	pthread_cond_destroy(&bkts->work_q.wakeup_worker);
+	pthread_mutex_destroy(&bkts->work_q.mut);
 }
 
-static rsRetVal
+static rsRetVal ATTR_NONNULL(1)
 enqueueFileWriteTask(dynstats_bucket_t *b, const char* file_name, const char* content) {
 	file_write_entry_t *task;
+	dynstats_buckets_t *bkts = &loadConf->dynstats_buckets;
 	DEFiRet;
-	
+	if (!bkts) {
+		FINALIZE
+	}
+
 	CHKmalloc(task = malloc(sizeof(file_write_entry_t)));
 	task->bucket = b;
 	task->name = strdup(file_name);
 	task->content = strdup(content);
-	
-	pthread_mutex_lock(&work_q.mut);
-	STAILQ_INSERT_TAIL(&work_q.q, task, link);
-	work_q.size++;
-	STATSCOUNTER_INC(work_q.ctrEnq, work_q.mutCtrEnq);
-	STATSCOUNTER_SETMAX_NOMUT(work_q.ctrMaxSz, work_q.size);
-	pthread_cond_signal(&work_q.wakeup_worker);
-	pthread_mutex_unlock(&work_q.mut);
+
+	pthread_mutex_lock(&bkts->work_q.mut);
+	STAILQ_INSERT_TAIL(&bkts->work_q.q, task, link);
+	bkts->work_q.size++;
+	STATSCOUNTER_INC(bkts->work_q.ctrEnq, bkts->work_q.mutCtrEnq);
+	STATSCOUNTER_SETMAX_NOMUT(bkts->work_q.ctrMaxSz, bkts->work_q.size);
+	if (bkts->work_q.size == 1) {
+		pthread_cond_signal(&bkts->work_q.wakeup_worker);
+	}
+	pthread_mutex_unlock(&bkts->work_q.mut);
 
 finalize_it:
 	if (iRet != RS_RET_OK) {
@@ -1091,21 +1109,23 @@ finalize_it:
 }
 
 static void
-startFileWriteWorker(void) {
-	pthread_mutex_lock(&work_q.mut); /* locking to keep Coverity happy */
-	wrkrRunning = 0;
-	pthread_mutex_unlock(&work_q.mut);
-	pthread_create(&wrkrInfo.tid, NULL, fileWriteWorker, &wrkrInfo);
-	assert(wrkrInfo.tid);
-	DBGPRINTF("dynstats: worker started tid: %llu workers\n", (unsigned long long)wrkrInfo.tid);
+startFileWriteWorker(dynstats_buckets_t *bkts) {
+	pthread_mutex_lock(&bkts->work_q.mut); /* locking to keep Coverity happy */
+	bkts->wrkrRunning = 0;
+	bkts->wkrTermState = 0;
+	pthread_mutex_unlock(&bkts->work_q.mut);
+	pthread_create(&bkts->wrkrInfo.tid, NULL, fileWriteWorker, bkts);
+	assert(bkts->wrkrInfo.tid);
+	DBGPRINTF("dynstats: worker started tid: %llu workers\n", (unsigned long long)bkts->wrkrInfo.tid);
 }
 
-static void
-stopFileWriteWorker(void) {
+static void ATTR_NONNULL(1)
+stopFileWriteWorker(dynstats_buckets_t *bkts) {
 	DBGPRINTF("dynstats: stoping worker pool\n");
-	pthread_mutex_lock(&work_q.mut);
-	pthread_cond_broadcast(&work_q.wakeup_worker); /* awake wrkr if not running */
-	pthread_mutex_unlock(&work_q.mut);
-	pthread_join(wrkrInfo.tid, NULL);
+	pthread_mutex_lock(&bkts->work_q.mut);
+	bkts->wkrTermState = 1;
+	pthread_cond_broadcast(&bkts->work_q.wakeup_worker); /* awake wrkr if not running */
+	pthread_mutex_unlock(&bkts->work_q.mut);
+	pthread_join(bkts->wrkrInfo.tid, NULL);
 	DBGPRINTF("dynstats: info: worker stopped\n");
 }

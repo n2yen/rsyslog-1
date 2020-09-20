@@ -18,6 +18,7 @@
 #ifndef INCLUDED_DYNSTATS_H
 #define INCLUDED_DYNSTATS_H
 
+#include <sys/queue.h>
 #include "hashtable.h"
 
 typedef struct hashtable htable;
@@ -50,9 +51,13 @@ struct dynstats_bucket_s {
 	ctr_t *pPurgeTriggeredCtr;
 
 	/* file writer thread updates these counters - currently takes the bucket lock */
-	intctr_t flushedBytes;
-	intctr_t flushedCount;
-	intctr_t flushedErrors;
+
+	STATSCOUNTER_DEF(ctrFlushedBytes, mutCtrFlushedBytes);
+	ctr_t *pCtrFlushedBytes;
+	STATSCOUNTER_DEF(ctrFlushed, mutCtrFlushed);
+	ctr_t *pCtrFlushed;
+	STATSCOUNTER_DEF(ctrFlushedErrors, mutCtrFlushedErrors);
+	ctr_t *pCtrFlushedErrors;
 
 	struct dynstats_bucket_s *next; /* linked list ptr */
 	struct dynstats_ctr_s *ctrs;
@@ -70,10 +75,24 @@ struct dynstats_bucket_s {
 	struct timespec metricCleanupTimeout;
 	uint8_t resettable;
 	uchar *state_file_directory;
-	uint32_t persist_state_interval;
-	uint32_t persist_state_time_interval;
+	uint32_t persist_state_write_count_interval; /* count of bucket updates before persisting */
+	uint32_t persist_state_interval_secs; /* interval in secs bucket before persisting bucket state */
 	time_t persist_expiration_time;
 	uint32_t n_updates; /* number of bucket updates before persisting the stream */
+};
+
+struct dynstats_file_write_queue_s {
+	STAILQ_HEAD(head, file_write_entry_s) q;
+	STATSCOUNTER_DEF(ctrEnq, mutCtrEnq);
+	int size;
+	int ctrMaxSz;
+	statsobj_t *stats;
+	pthread_mutex_t mut;
+	pthread_cond_t wakeup_worker;
+};
+
+struct dynstats_wrkrInfo_s {
+	pthread_t tid;	/* the worker's thread ID */
 };
 
 struct dynstats_buckets_s {
@@ -81,6 +100,12 @@ struct dynstats_buckets_s {
 	statsobj_t *global_stats;
 	pthread_rwlock_t lock;
 	uint8_t initialized;
+	/* background file write worker data */
+	struct dynstats_file_write_queue_s work_q;
+	uint32_t max_queue_size;
+	uint8_t wrkrRunning;
+	uint8_t wkrTermState;
+	struct dynstats_wrkrInfo_s wrkrInfo;
 };
 
 rsRetVal dynstats_initCnf(dynstats_buckets_t *b);
