@@ -352,20 +352,16 @@ exit_thread(__attribute__((unused)) const struct mg_context *ctx,
 static rsRetVal
 msgAddMetadataFromHttpHeader(smsg_t *const __restrict__ pMsg, struct conn_wrkr_s *connWrkr)
 {
+	struct json_object *json = NULL;
 	DEFiRet;
 	const struct mg_request_info *ri = connWrkr->pri;
 	#define MAX_HTTP_HEADERS 64	/* hard limit */
 	int count = min(ri->num_headers, MAX_HTTP_HEADERS);
 
-	struct json_object *const json = json_object_new_object();
-	CHKmalloc(json);
+	CHKmalloc(json = json_object_new_object());
 	for (int i = 0 ; i < count ; i++ ) {
 		struct json_object *const jval = json_object_new_string(ri->http_headers[i].value);
-		if(jval == NULL) {
-			json_object_put(json);
-			ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
-		}
-
+		CHKmalloc(jval);
 		/* truncate header names bigger than INIT_SCRATCH_BUF_SIZE */
 		strncpy(connWrkr->pScratchBuf, ri->http_headers[i].name, connWrkr->scratchBufSize - 1);
 		/* make header lowercase */
@@ -376,8 +372,48 @@ msgAddMetadataFromHttpHeader(smsg_t *const __restrict__ pMsg, struct conn_wrkr_s
 		}
 		json_object_object_add(json, (const char *const)connWrkr->pScratchBuf, jval);
 	}
-	iRet = msgAddJSON(pMsg, (uchar*)"!metadata!httpheaders", json, 0, 0);
+	CHKiRet(msgAddJSON(pMsg, (uchar*)"!metadata!httpheaders", json, 0, 0));
+
 finalize_it:
+	if (iRet != RS_RET_OK && json) {
+		json_object_put(json);
+	}
+	RETiRet;
+}
+
+static rsRetVal
+msgAddMetadataFromHttpQueryParams(smsg_t *const __restrict__ pMsg, struct conn_wrkr_s *connWrkr)
+{
+	struct json_object *json = NULL;
+	DEFiRet;
+	const struct mg_request_info *ri = connWrkr->pri;
+
+	if (ri && ri->query_string) {
+		strncpy(connWrkr->pScratchBuf, ri->query_string, connWrkr->scratchBufSize - 1);
+		char *pquery_str = connWrkr->pScratchBuf;
+		if (pquery_str) {
+			CHKmalloc(json = json_object_new_object());
+
+			char* saveptr = NULL;
+			char *kv_pair = strtok_r(pquery_str, "&;", &saveptr);
+
+			for ( ; kv_pair != NULL; kv_pair = strtok_r(NULL, "&;", &saveptr)) {
+				char *saveptr2 = NULL;
+				char *key = strtok_r(kv_pair, "=", &saveptr2);
+				if (key) {
+					char *value = strtok_r(NULL, "=", &saveptr2);
+					struct json_object *const jval = json_object_new_string(value);
+					CHKmalloc(jval);
+					json_object_object_add(json, (const char *)key, jval);
+				}
+			}
+			CHKiRet(msgAddJSON(pMsg, (uchar*)"!metadata!queryparams", json, 0, 0));
+		}
+	}
+finalize_it:
+	if (iRet != RS_RET_OK && json) {
+		json_object_put(json);
+	}
 	RETiRet;
 }
 
@@ -415,6 +451,7 @@ doSubmitMsg(const instanceConf_t *const __restrict__ inst,
 
 	if (inst->bAddMetadata) {
 		CHKiRet(msgAddMetadataFromHttpHeader(pMsg, connWrkr));
+		CHKiRet(msgAddMetadataFromHttpQueryParams(pMsg, connWrkr));
 	}
 
 	ratelimitAddMsg(inst->ratelimiter, &connWrkr->multiSub, pMsg);
