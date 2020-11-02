@@ -1829,6 +1829,111 @@ finalize_it:
 	varFreeMembers(&srcVal[1]);
 }
 
+/* TODO: rename this to a more appropriate name, this can now handle not just arrays, but
+				dynamic object evaluations. For now, we can support any CEE vars, that is:
+				[$!, $., $/] e.g. PROP_CEE, PROP_LOCAL, PROP_GLOBAL
+		we should in theory also be able to support dynamic translation of a msg property. although msg property
+		is not needed as they don't have hierarchical values.
+*/
+static void ATTR_NONNULL()
+doFunc_get_property_by_key(struct cnffunc *__restrict__ const func,
+	struct svar *__restrict__ const ret,
+	void *const usrptr,
+	wti_t *const pWti)
+{
+	int retVal = RS_SCRIPT_EOK;
+	struct svar srcVal[2];
+	int bMustFree, bMustFree2;
+	smsg_t *const pMsg = (smsg_t*)usrptr;
+	/* parses out the value and the type , e.g. string, string value*/
+	cnfexprEval(func->expr[0], &srcVal[0], usrptr, pWti);
+	cnfexprEval(func->expr[1], &srcVal[1], usrptr, pWti);
+
+	char *container = (char*) var2CString(&srcVal[0], &bMustFree);
+	char *expr =(char*) var2CString(&srcVal[1], &bMustFree2);
+	assert(pMsg != NULL);
+	assert(container != NULL);
+	assert(expr != NULL);
+	printf("param1: %s\n", container);
+	printf("param2: %s\n", expr);
+
+	rsRetVal localRet = RS_RET_OK;
+	msgPropDescr_t pProp;
+	struct json_object *exprJson = NULL;
+	uchar *exprCstr = NULL;
+	struct json_object *json = NULL;
+	uchar *cstr = NULL;
+	msgPropDescrFill(&pProp, (uchar*)container, strlen(container));
+	localRet = msgGetJSONPropJSONorString(pMsg, &pProp, &json, &cstr);
+	msgPropDescrDestruct(&pProp);
+	if (localRet != RS_RET_OK) {
+		retVal = RS_SCRIPT_EINVAL;
+		FINALIZE;
+	}
+
+	msgPropDescrFill(&pProp, (uchar*)expr, strlen(expr));
+	localRet = msgGetJSONPropJSONorString(pMsg, &pProp, &exprJson, &exprCstr);
+	msgPropDescrDestruct(&pProp);
+	if (localRet != RS_RET_OK) {
+		retVal = RS_SCRIPT_EINVAL;
+		assert(0);
+		FINALIZE;
+	}
+
+	switch (json_object_get_type(json)) {
+		case json_type_object: {
+			printf("this is json object, do lookup by key=%s\n", exprCstr);
+			if (exprCstr && !json_object_object_get_ex(json, (char*)exprCstr, &ret->d.json)) {
+				retVal = RS_SCRIPT_EINVAL;
+				FINALIZE;
+			}
+			ret->d.json = json_object_get(ret->d.json);
+			break;
+		}
+		case json_type_array: {
+			printf("json expression type: %d, value: %s\n",
+						json_object_get_type(exprJson), json_object_get_string(exprJson));
+			if (json_object_get_type(exprJson) != json_type_int) {
+				retVal = RS_SCRIPT_EINVAL;
+			}
+			ret->d.json = json_object_get(json_object_array_get_idx(json, json_object_get_int64(exprJson)));
+			break;
+		}
+		default:
+			printf("Unhandled json type!!!!\n");
+			retVal = RS_SCRIPT_EINVAL;
+			break;
+	}
+
+finalize_it:
+	wtiSetScriptErrno(pWti, retVal);
+
+	if (retVal != RS_SCRIPT_EOK || !ret->d.json) {
+		ret->datatype = 'S';
+		ret->d.estr = es_newStrFromCStr("", 1);
+	} else {
+		/* json object successfully set */
+		ret->datatype = 'J';
+	}
+	if (exprCstr) {
+		free(exprCstr);
+	}
+	if (exprJson) {
+		json_object_put(exprJson);
+	}
+	if (json) {
+		json_object_put(json);
+	}
+	if(bMustFree) {
+		free(container);
+	}
+	if (bMustFree2) {
+		free(expr);
+	}
+	varFreeMembers(&srcVal[0]);
+	varFreeMembers(&srcVal[1]);
+}
+
 static void ATTR_NONNULL()
 doFunct_RandomGen(struct cnffunc *__restrict__ const func,
 	struct svar *__restrict__ const ret,
@@ -2922,6 +3027,7 @@ cnfexprEval(const struct cnfexpr *__restrict__ const expr,
 	long long n_r, n_l;
 
 	DBGPRINTF("eval expr %p, type '%s'\n", expr, tokenToString(expr->nodetype));
+	printf("eval expr %p, type '%s'\n", expr, tokenToString(expr->nodetype));
 	switch(expr->nodetype) {
 	/* note: comparison operations are extremely similar. The code can be copyied, only
 	 * places flagged with "CMP" need to be changed.
@@ -3615,6 +3721,7 @@ static struct scriptFunct functions[] = {
 	{"parse_time", 1, 1, doFunct_ParseTime, NULL, NULL},
 	{"is_time", 1, 2, doFunct_IsTime, NULL, NULL},
 	{"parse_json", 2, 2, doFunc_parse_json, NULL, NULL},
+	{"get_property_by_key", 2, 2, doFunc_get_property_by_key, NULL, NULL},
 	{"script_error", 0, 0, doFunct_ScriptError, NULL, NULL},
 	{"previous_action_suspended", 0, 0, doFunct_PreviousActionSuspended, NULL, NULL},
 	{NULL, 0, 0, NULL, NULL, NULL} //last element to check end of array
