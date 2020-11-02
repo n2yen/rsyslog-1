@@ -66,6 +66,8 @@ struct cnfexpr* cnfexprOptimize(struct cnfexpr *expr);
 static void cnfstmtOptimizePRIFilt(struct cnfstmt *stmt);
 static void cnfarrayPrint(struct cnfarray *ar, int indent);
 struct cnffunc * cnffuncNew_prifilt(int fac);
+static void evalVar(struct cnfvar *__restrict__ const var, void *__restrict__ const usrptr,
+	struct svar *__restrict__ const ret);
 
 static struct cnfparamdescr incpdescr[] = {
 	{ "file", eCmdHdlrString, 0 },
@@ -1830,6 +1832,419 @@ finalize_it:
 }
 
 static void ATTR_NONNULL()
+doFunc_json_array_len(struct cnffunc *__restrict__ const func,
+	struct svar *__restrict__ const ret,
+	void *const usrptr,
+	wti_t *const pWti)
+{
+	struct svar srcVal;
+	int bMustFree;
+	smsg_t *const pMsg = (smsg_t*)usrptr;
+	cnfexprEval(func->expr[0], &srcVal, usrptr, pWti);
+	char *container = (char*) var2CString(&srcVal, &bMustFree);
+	struct json_object *json;
+	rsRetVal localRet = RS_RET_OK;
+
+	int retVal = RS_SCRIPT_EOK;
+	assert(container != NULL);
+	assert(pMsg != NULL);
+
+	msgPropDescr_t pProp;
+	msgPropDescrFill(&pProp, (uchar*)container, strlen(container));
+	localRet = msgGetJSONPropJSON(pMsg, &pProp, &json);
+	msgPropDescrDestruct(&pProp);
+	ret->d.n = 0;
+	if (json_object_get_type(json) != json_type_array) {
+		retVal = RS_SCRIPT_EINVAL;
+		FINALIZE;
+	}
+	ret->d.n = json_object_array_length(json);
+
+finalize_it:
+	wtiSetScriptErrno(pWti, retVal);
+	json_object_put(json);
+	ret->datatype = 'N';
+	if(bMustFree) {
+		free(container);
+	}
+
+	varFreeMembers(&srcVal);
+}
+
+/* TODO: rename this to a more appropriate name, this can now handle not just arrays, but
+				dynamic object evaluations. For now, we can support any CEE vars, that is:
+				[$!, $., $/] e.g. PROP_CEE, PROP_LOCAL, PROP_GLOBAL
+		we should in theory also be able to support dynamic translation of a msg property. although msg property
+		is not needed as they don't have hierarchical values.
+*/
+static void ATTR_NONNULL()
+doFunc_get_property_by_key(struct cnffunc *__restrict__ const func,
+	struct svar *__restrict__ const ret,
+	void *const usrptr,
+	wti_t *const pWti)
+{
+	int retVal = RS_SCRIPT_EOK;
+	struct svar srcVal[2];
+	int bMustFree, bMustFree2;
+	smsg_t *const pMsg = (smsg_t*)usrptr;
+	/* parses out the value and the type , e.g. string, string value*/
+	cnfexprEval(func->expr[0], &srcVal[0], usrptr, pWti);
+	cnfexprEval(func->expr[1], &srcVal[1], usrptr, pWti);
+
+	char *container = (char*) var2CString(&srcVal[0], &bMustFree);
+	char *expr =(char*) var2CString(&srcVal[1], &bMustFree2);
+	assert(pMsg != NULL);
+	assert(container != NULL);
+	assert(expr != NULL);
+	printf("param1: %s\n", container);
+	printf("param2: %s\n", expr);
+
+	rsRetVal localRet = RS_RET_OK;
+	msgPropDescr_t pProp;
+	struct json_object *exprJson = NULL;
+	uchar *exprCstr = NULL;
+	struct json_object *json = NULL;
+	uchar *cstr = NULL;
+	msgPropDescrFill(&pProp, (uchar*)container, strlen(container));
+	localRet = msgGetJSONPropJSONorString(pMsg, &pProp, &json, &cstr);
+	msgPropDescrDestruct(&pProp);
+	if (localRet != RS_RET_OK) {
+		retVal = RS_SCRIPT_EINVAL;
+		FINALIZE;
+	}
+
+	msgPropDescrFill(&pProp, (uchar*)expr, strlen(expr));
+	localRet = msgGetJSONPropJSONorString(pMsg, &pProp, &exprJson, &exprCstr);
+	msgPropDescrDestruct(&pProp);
+	if (localRet != RS_RET_OK) {
+		retVal = RS_SCRIPT_EINVAL;
+		assert(0);
+		FINALIZE;
+	}
+
+	switch (json_object_get_type(json)) {
+		case json_type_object: {
+			printf("this is json object, do lookup by key=%s\n", exprCstr);
+			if (exprCstr && !json_object_object_get_ex(json, (char*)exprCstr, &ret->d.json)) {
+				retVal = RS_SCRIPT_EINVAL;
+			} else {
+				//assert(0);
+			}
+#if 1
+			ret->d.json = json_object_get(ret->d.json);
+			if (json) {
+				json_object_put(json);
+			}
+#endif
+			break;
+		}
+		case json_type_array: {
+			printf("json expression type: %d, value: %s\n",
+						json_object_get_type(exprJson), json_object_get_string(exprJson));
+			if (json_object_get_type(exprJson) != json_type_int) {
+				retVal = RS_SCRIPT_EINVAL;
+			}
+#if 0
+			int64 index = json_object_get_int64(exprJson);
+			if (index < json_object_array_length(json)) {
+				ret->d.json = json_object_get(json_object_array_get_idx(json, index));
+			} else {
+				retVal = RS_SCRIPT_EINVAL;
+			}
+#else
+			ret->d.json = json_object_get(json_object_array_get_idx(json, json_object_get_int64(exprJson)));
+			json_object_put(json);
+#endif
+			break;
+		}
+		default:
+			printf("Unhandled json type!!!!\n");
+			retVal = RS_SCRIPT_EINVAL;
+			break;
+	}
+
+finalize_it:
+	wtiSetScriptErrno(pWti, retVal);
+
+	if (retVal != RS_SCRIPT_EOK || !ret->d.json) {
+		ret->datatype = 'S';
+		ret->d.estr = es_newStrFromCStr("", 1);
+	} else {
+		/* json object successfully set */
+		ret->datatype = 'J';
+	}
+	if (exprCstr) {
+		free(exprCstr);
+	}
+	if (exprJson) {
+		json_object_put(exprJson);
+	}
+#if 0
+	if (json) {
+		json_object_put(json);
+	}
+#endif
+	if(bMustFree) {
+		free(container);
+	}
+	if (bMustFree2) {
+		free(expr);
+	}
+	varFreeMembers(&srcVal[0]);
+	varFreeMembers(&srcVal[1]);
+}
+
+#if 1
+static sbool isAllowedVarChar(char ch) {
+	return isdigit(ch) || isalpha(ch) || isspace(ch) || ch == '-' || ch == '_';
+}
+
+static void ATTR_NONNULL()
+doFunc_json_array_get2(struct cnffunc *__restrict__ const func,
+	struct svar *__restrict__ const ret,
+	void *const usrptr,
+	wti_t *const pWti)
+{
+	int retVal = RS_SCRIPT_EOK;
+	struct svar srcVal[2];
+	int bMustFree;
+	int success = 0;
+	smsg_t *const pMsg = (smsg_t*)usrptr;
+	/* parses out the value and the type , e.g. string, string value*/
+#if 1
+	printf("eval epression 1...\n");
+	cnfexprEval(func->expr[0], &srcVal[0], usrptr, pWti);
+	printf("done.\n");
+#else
+	cnfexprDeepEval(func->expr[0], &srcVal[0], usrptr, pWti);
+#endif
+	cnfexprEval(func->expr[1], &srcVal[1], usrptr, pWti);
+
+	char *expression = (char*) var2CString(&srcVal[0], &bMustFree);
+	long long index = var2Number(&srcVal[1], &success);
+	assert(pMsg != NULL);
+	assert(expression != NULL);
+
+	if (index < INT_MIN || index > INT_MAX) {
+		retVal = RS_SCRIPT_EINVAL;
+		FINALIZE;
+	}
+#if 1
+	char *pEvalExpression = NULL;
+	if (*expression == '$') {
+		size_t expressionLen = strlen(expression);
+		size_t evalExprLen = 2 * expressionLen;
+		pEvalExpression = calloc(evalExprLen, sizeof(char));
+		size_t evalExprOffset = 0;
+
+		printf(">>>> parsing out expression: '%s', len=%lu\n", expression, expressionLen);
+
+#if 0
+		size_t i = 1;
+		while (i < expressionLen; ++i) {
+			char ch = expression[i];
+			if (ch == '$') {
+				const char *pEndStr = expression[i];
+				int count = 0;
+				while (*pEndStr != '\0') {
+					if (!isAllowedVarChar(*pEndStr)) {
+						break;
+					}
+					pEndStr++;
+					++count;
+				}
+			} else {
+				if (evalExprOffset >= evalExprLen) {
+					pEvalExpression = realloc(pEvalExpression, evalExprLen);
+					// do mem check
+				}
+				++i;
+			}
+		}
+#else
+		char *pStartStr = expression+1;
+		while (pStartStr && (size_t)(pStartStr - expression) < expressionLen) {
+			//printf(">> subexpression: %s\n", pStartStr);
+			if (*pStartStr == '$') {
+				char *pEndStr = pStartStr;
+				//printf (">>>> 1: '%s'\n", pstr);
+				while (*pEndStr != '\0' && *pEndStr != '!' && *pEndStr != '[' && *pEndStr != ']') {
+					//printf (">>>> 2: %s\n", pEndStr);
+					pEndStr++;
+				}
+				int count = pEndStr - pStartStr;
+				char *pSubStr = strndup(pStartStr, count);
+				// get the value of this variable and add it the list of things we need to concat
+
+				struct svar varRet;
+				struct cnfvar *var = cnfvarNew(pSubStr);
+				const char *evalStr = NULL;
+
+				printf(">>> cnfvar prop.id: %d, name: %s\n", var->prop.id,
+							 var->prop.name);
+				printf("0. evaluated expression datatype: '%c'\n", varRet.datatype);
+				evalVar(var, usrptr, &varRet);
+				if (varRet.datatype == 'N') {
+					printf("1. evaluated expression from: '%s' => '%lld'\n", pSubStr,
+								 varRet.d.n);
+				} else if (varRet.datatype == 'S') {
+					printf("2. evaluated expression from: '%s' => '%s'\n", pSubStr,
+								 es_str2cstr(varRet.d.estr, NULL));
+					evalStr = es_str2cstr(varRet.d.estr, NULL);
+				} else if (varRet.datatype == 'J') {
+					// we expect a 'stringified json value
+					printf("3. evaluated expression from: '%s' => '%s'\n", pSubStr,
+								 json_object_get_string(varRet.d.json));
+					evalStr = json_object_get_string(varRet.d.json);
+				} else {
+					printf("evaluated expression from: '%s' unexpected datatype: %c\n",
+								 pSubStr, varRet.datatype);
+				}
+
+				if (evalStr) {
+					strncpy(pEvalExpression+evalExprOffset, evalStr, (evalExprLen - evalExprOffset));
+					evalExprOffset += strlen(evalStr);
+				}
+
+				pStartStr += count;
+				printf ("subExpr: %s, offset: %ld\n", pSubStr, pStartStr - expression);
+			} else {
+				if (evalExprOffset >= evalExprLen) {
+					pEvalExpression = realloc(pEvalExpression, evalExprLen);
+					// do mem check
+				}
+				pEvalExpression[evalExprOffset++] = *pStartStr;
+				pStartStr++;
+			}
+		}
+#endif
+	} else {
+		pEvalExpression = expression;
+	}
+
+	printf(">> Final evaluated expression: %s\n", pEvalExpression);
+#endif
+	msgPropDescr_t pProp;
+	struct json_object *json = NULL;
+
+	//msgPropDescrFill(&pProp, (uchar*)expression, strlen(expression));
+	msgPropDescrFill(&pProp, (uchar*)pEvalExpression, strlen(pEvalExpression));
+	/* question, can we get this function to consider variables in the string? */
+	if (msgGetJSONPropJSON(pMsg, &pProp, &json) != RS_RET_OK) {
+		retVal = RS_SCRIPT_EINVAL;
+		FINALIZE;
+	}
+
+	ret->d.json = json;
+	assert(ret->d.json);
+
+finalize_it:
+	wtiSetScriptErrno(pWti, retVal);
+	if (retVal != RS_SCRIPT_EOK || !ret->d.json) {
+		ret->datatype = 'S';
+		ret->d.estr = es_newStrFromCStr("", 1);
+	} else {
+		/* json object successfully set */
+		ret->datatype = 'J';
+	}
+	if(bMustFree) {
+		free(expression);
+	}
+	varFreeMembers(&srcVal[0]);
+	varFreeMembers(&srcVal[1]);
+}
+#else
+static void ATTR_NONNULL()
+doFunc_json_array_get2(struct cnffunc *__restrict__ const func,
+	struct svar *__restrict__ const ret,
+	void *const usrptr,
+	wti_t *const pWti)
+{
+	int retVal = RS_SCRIPT_EOK;
+	struct svar srcVal[2];
+	int bMustFree;
+	int success = 0;
+	smsg_t *const pMsg = (smsg_t*)usrptr;
+	/* parses out the value and the type , e.g. string, string value*/
+	cnfexprEval(func->expr[0], &srcVal[0], usrptr, pWti);
+	cnfexprEval(func->expr[1], &srcVal[1], usrptr, pWti);
+
+	/* TODO: it may be possible to evaluate the entire input
+			and build the a new expression based on each one. pseudo code might be something like:
+
+			for each substring that starts with '$' and ends with either '!' or end of string:
+			do
+				cnfexprEval(substring);
+				append result to string
+			end
+
+			cnfexprEval(entire string)
+	 */
+
+	char *container = (char*) var2CString(&srcVal[0], &bMustFree);
+	long long index = var2Number(&srcVal[1], &success);
+	assert(pMsg != NULL);
+	assert(container != NULL);
+
+	if (index < INT_MIN || index > INT_MAX) {
+		retVal = RS_SCRIPT_EINVAL;
+		FINALIZE;
+	}
+
+	msgPropDescr_t pProp;
+	struct json_object *json = NULL;
+
+	msgPropDescrFill(&pProp, (uchar*)container, strlen(container));
+	/* question, can we get this function to consider variables in the string? */
+	if (msgGetJSONPropJSON(pMsg, &pProp, &json) != RS_RET_OK) {
+		retVal = RS_SCRIPT_EINVAL;
+		FINALIZE;
+	}
+
+
+#if 0
+	if (json_object_get_type(json) != json_type_array) {
+		retVal = RS_SCRIPT_EINVAL;
+		FINALIZE;
+	}
+	if (index >= json_object_array_length(json)) {
+		retVal = RS_SCRIPT_EINVAL;
+		FINALIZE;
+	}
+
+	/* TODO: this should do a copy
+	 * unless we want to support return by reference.
+	 */
+	ret->d.json = json_object_get(json_object_array_get_idx(json, index));
+	msgPropDescrDestruct(&pProp);
+	json_object_put(json);
+#else
+	ret->d.json = json;
+	assert(ret->d.json);
+	msgPropDescrDestruct(&pProp);
+	//json_object_put(json);
+#endif
+
+finalize_it:
+	wtiSetScriptErrno(pWti, retVal);
+	if (retVal != RS_SCRIPT_EOK || !ret->d.json) {
+		ret->datatype = 'S';
+		ret->d.estr = es_newStrFromCStr("", 1);
+	} else {
+		/* json object successfully set */
+		ret->datatype = 'J';
+	}
+	if(bMustFree) {
+		free(container);
+	}
+	varFreeMembers(&srcVal[0]);
+	varFreeMembers(&srcVal[1]);
+}
+#endif
+
+
+
+static void ATTR_NONNULL()
 doFunct_RandomGen(struct cnffunc *__restrict__ const func,
 	struct svar *__restrict__ const ret,
 	void *__restrict__ const usrptr,
@@ -2922,6 +3337,7 @@ cnfexprEval(const struct cnfexpr *__restrict__ const expr,
 	long long n_r, n_l;
 
 	DBGPRINTF("eval expr %p, type '%s'\n", expr, tokenToString(expr->nodetype));
+	printf("eval expr %p, type '%s'\n", expr, tokenToString(expr->nodetype));
 	switch(expr->nodetype) {
 	/* note: comparison operations are extremely similar. The code can be copyied, only
 	 * places flagged with "CMP" need to be changed.
@@ -3615,6 +4031,9 @@ static struct scriptFunct functions[] = {
 	{"parse_time", 1, 1, doFunct_ParseTime, NULL, NULL},
 	{"is_time", 1, 2, doFunct_IsTime, NULL, NULL},
 	{"parse_json", 2, 2, doFunc_parse_json, NULL, NULL},
+	{"json_array_length", 1, 1, doFunc_json_array_len, NULL, NULL},
+	{"get_property_by_key", 2, 2, doFunc_get_property_by_key, NULL, NULL},
+	{"json_array_get2", 2, 2, doFunc_json_array_get2, NULL, NULL},
 	{"script_error", 0, 0, doFunct_ScriptError, NULL, NULL},
 	{"previous_action_suspended", 0, 0, doFunct_PreviousActionSuspended, NULL, NULL},
 	{NULL, 0, 0, NULL, NULL, NULL} //last element to check end of array
@@ -3793,6 +4212,35 @@ cnfexprEvalCollection(struct cnfexpr *__restrict__ const expr, void *__restrict_
 	}
 	return retptr;
 }
+
+#if 0
+void ATTR_NONNULL()
+cnfexprDeepEval(struct cnfexpr *__restrict__ expr,
+	struct svar *__restrict__ const ret,
+	void *__restrict__ const usrptr,
+	wti_t *const pWti)
+{
+	struct svar ret;
+	void *retptr;
+	printf(">>>> parsing out expression: '%s'\n", expression);
+	char *saveptr = NULL;
+	char *pSubExpr = strtok_r(expression, "$", &saveptr);
+	// build out the var string.
+	for (; pSubExpr != NULL; pSubExpr = strtok_r(NULL, "[$]", &saveptr)) {
+		printf(">> subexpression: %s\n", pSubExpr);
+		struct cnfexpr *expr;
+
+		cnfexprEval(psubexpr, )
+		if (ret.datatype == 'N') {
+			;
+		} else if (ret.datatype == 'S') {
+			;
+		} else {
+			;
+		}
+	}
+}
+#endif
 
 static void
 doIndent(int indent)
