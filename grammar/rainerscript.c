@@ -1829,6 +1829,112 @@ finalize_it:
 	varFreeMembers(&srcVal[1]);
 }
 
+
+static void ATTR_NONNULL()
+doFunc_get_property_by_dynkey(struct cnffunc *__restrict__ const func,
+	struct svar *__restrict__ const ret,
+	void *const usrptr,
+	wti_t *const pWti)
+{
+	int retVal = RS_SCRIPT_EOK;
+	int bMustFree = 0;
+	struct svar srcVal[2];
+	/* parses out the value and the type , e.g. string, string value*/
+	cnfexprEval(func->expr[0], &srcVal[0], usrptr, pWti);
+	cnfexprEval(func->expr[1], &srcVal[1], usrptr, pWti);
+
+	printf("srcval[0] datatype: %c\n", srcVal[0].datatype);
+	printf("srcval[1] datatype: %c\n", srcVal[1].datatype);
+	struct json_object *json;
+
+	switch (srcVal[0].datatype) {
+		case 'J': {
+			json = srcVal[0].d.json;
+			break;
+		}
+		case 'S': {
+			ret->d.estr = es_strdup(srcVal[0].d.estr);
+			ret->datatype = 'S';
+			FINALIZE;
+			break;
+		}
+		default: {
+			ret->d.estr = es_newStrFromCStr("", 1);
+			ret->datatype = 'S';
+			FINALIZE;
+			break;
+		}
+	}
+
+	char *expr = NULL;
+	switch (json_object_get_type(json)) {
+		case json_type_object: {
+			expr = (char*) var2CString(&srcVal[1], &bMustFree);
+			if (expr && expr[0] == '\0') {
+				// just return the object
+				ret->d.json = json_object_get(json);
+				ret->datatype = 'J';
+				break;
+			}
+			if (expr && !json_object_object_get_ex(json, (char*)expr, &ret->d.json)) {
+					retVal = RS_SCRIPT_EINVAL;
+					FINALIZE;
+			}
+			ret->d.json = json_object_get(ret->d.json);
+			ret->datatype = 'J';
+			break;
+		}
+		case json_type_array: {
+			int success = 0;
+			long long index = var2Number(&srcVal[1], &success);
+			if (!success || index < 0 || (size_t)index >= sizeof(size_t)) {
+				retVal = RS_SCRIPT_EINVAL;
+				FINALIZE;
+			}
+			ret->d.json = json_object_get(json_object_array_get_idx(json, index));
+			ret->datatype = 'J';
+			break;
+		}
+		case json_type_boolean:
+		case json_type_int: {
+			ret->d.n = json_object_get_int64(json);
+			ret->datatype = 'N';
+			break;
+		}
+		case json_type_double: {
+			ret->d.n = json_object_get_double(json);
+			ret->datatype = 'N';
+			break;
+		}
+		case json_type_string: {
+			ret->d.estr = es_newStrFromCStr(json_object_get_string(json), json_object_get_string_len(json));
+			ret->datatype = 'S';
+			break;
+		}
+		case json_type_null: {
+			ret->datatype = 'S';
+			ret->d.estr = es_newStrFromCStr("", 1);
+		}
+		default:
+			printf("Unhandled json type(%d) !!!!\n", json_object_get_type(json));
+			retVal = RS_SCRIPT_EINVAL;
+			break;
+	}
+
+finalize_it:
+	wtiSetScriptErrno(pWti, retVal);
+
+	if (retVal != RS_SCRIPT_EOK) {
+		ret->datatype = 'S';
+		ret->d.estr = es_newStrFromCStr("", 1);
+	}
+	if (bMustFree) {
+		free(expr);
+	}
+	varFreeMembers(&srcVal[0]);
+	varFreeMembers(&srcVal[1]);
+}
+
 /* TODO: rename this to a more appropriate name, this can now handle not just arrays, but
 				dynamic object evaluations. For now, we can support any CEE vars, that is:
 				[$!, $., $/] e.g. PROP_CEE, PROP_LOCAL, PROP_GLOBAL
@@ -1836,7 +1942,7 @@ finalize_it:
 		is not needed as they don't have hierarchical values.
 */
 static void ATTR_NONNULL()
-doFunc_get_property_by_key(struct cnffunc *__restrict__ const func,
+doFunc_get_property_by_dynkey2(struct cnffunc *__restrict__ const func,
 	struct svar *__restrict__ const ret,
 	void *const usrptr,
 	wti_t *const pWti)
@@ -1848,6 +1954,9 @@ doFunc_get_property_by_key(struct cnffunc *__restrict__ const func,
 	/* parses out the value and the type , e.g. string, string value*/
 	cnfexprEval(func->expr[0], &srcVal[0], usrptr, pWti);
 	cnfexprEval(func->expr[1], &srcVal[1], usrptr, pWti);
+
+	printf("srcval[0] datatype: %c\n", srcVal[0].datatype);
+	printf("srcval[1] datatype: %c\n", srcVal[1].datatype);
 
 	char *container = (char*) var2CString(&srcVal[0], &bMustFree);
 	char *expr =(char*) var2CString(&srcVal[1], &bMustFree2);
@@ -1871,23 +1980,42 @@ doFunc_get_property_by_key(struct cnffunc *__restrict__ const func,
 		FINALIZE;
 	}
 
-	msgPropDescrFill(&pProp, (uchar*)expr, strlen(expr));
-	localRet = msgGetJSONPropJSONorString(pMsg, &pProp, &exprJson, &exprCstr);
-	msgPropDescrDestruct(&pProp);
-	if (localRet != RS_RET_OK) {
-		retVal = RS_SCRIPT_EINVAL;
-		assert(0);
+	if (cstr) {
+		ret->d.estr = es_newStrFromCStr((char*)cstr, ustrlen(cstr));
 		FINALIZE;
+	}
+
+	if (expr && expr[0] == '$') {
+		msgPropDescrFill(&pProp, (uchar *)expr, strlen(expr));
+		localRet = msgGetJSONPropJSONorString(pMsg, &pProp, &exprJson, &exprCstr);
+		msgPropDescrDestruct(&pProp);
+		if (localRet != RS_RET_OK) {
+			retVal = RS_SCRIPT_EINVAL;
+			printf("could not get msgprop: %s\n", expr);
+			 assert(0);
+		}
+	} else {
+		// use the expr
+		;
 	}
 
 	switch (json_object_get_type(json)) {
 		case json_type_object: {
-			printf("this is json object, do lookup by key=%s\n", exprCstr);
-			if (exprCstr && !json_object_object_get_ex(json, (char*)exprCstr, &ret->d.json)) {
+			if (exprCstr && exprCstr[0] == '\0') {
+				// just return the object
+				ret->d.json = json_object_get(ret->d.json);
+				ret->datatype = 'J';
+				break;
+			}
+			if (expr && !json_object_object_get_ex(json, (char*)expr, &ret->d.json)) {
+					retVal = RS_SCRIPT_EINVAL;
+					FINALIZE;
+			} else if (exprCstr && !json_object_object_get_ex(json, (char*)exprCstr, &ret->d.json)) {
 				retVal = RS_SCRIPT_EINVAL;
 				FINALIZE;
 			}
 			ret->d.json = json_object_get(ret->d.json);
+			ret->datatype = 'J';
 			break;
 		}
 		case json_type_array: {
@@ -1897,10 +2025,31 @@ doFunc_get_property_by_key(struct cnffunc *__restrict__ const func,
 				retVal = RS_SCRIPT_EINVAL;
 			}
 			ret->d.json = json_object_get(json_object_array_get_idx(json, json_object_get_int64(exprJson)));
+			ret->datatype = 'J';
 			break;
 		}
+		case json_type_boolean:
+		case json_type_int: {
+			ret->d.n = json_object_get_int64(json);
+			ret->datatype = 'N';
+			break;
+		}
+		case json_type_double: {
+			ret->d.n = json_object_get_double(json);
+			ret->datatype = 'N';
+			break;
+		}
+		case json_type_string: {
+			ret->d.estr = es_newStrFromCStr(json_object_get_string(json), json_object_get_string_len(json));
+			ret->datatype = 'S';
+			break;
+		}
+		case json_type_null: {
+			ret->datatype = 'S';
+			ret->d.estr = es_newStrFromCStr("", 1);
+		}
 		default:
-			printf("Unhandled json type!!!!\n");
+			printf("Unhandled json type(%d) !!!!\n", json_object_get_type(json));
 			retVal = RS_SCRIPT_EINVAL;
 			break;
 	}
@@ -1908,12 +2057,9 @@ doFunc_get_property_by_key(struct cnffunc *__restrict__ const func,
 finalize_it:
 	wtiSetScriptErrno(pWti, retVal);
 
-	if (retVal != RS_SCRIPT_EOK || !ret->d.json) {
+	if (retVal != RS_SCRIPT_EOK) {
 		ret->datatype = 'S';
 		ret->d.estr = es_newStrFromCStr("", 1);
-	} else {
-		/* json object successfully set */
-		ret->datatype = 'J';
 	}
 	if (exprCstr) {
 		free(exprCstr);
@@ -3027,7 +3173,6 @@ cnfexprEval(const struct cnfexpr *__restrict__ const expr,
 	long long n_r, n_l;
 
 	DBGPRINTF("eval expr %p, type '%s'\n", expr, tokenToString(expr->nodetype));
-	printf("eval expr %p, type '%s'\n", expr, tokenToString(expr->nodetype));
 	switch(expr->nodetype) {
 	/* note: comparison operations are extremely similar. The code can be copyied, only
 	 * places flagged with "CMP" need to be changed.
@@ -3721,7 +3866,7 @@ static struct scriptFunct functions[] = {
 	{"parse_time", 1, 1, doFunct_ParseTime, NULL, NULL},
 	{"is_time", 1, 2, doFunct_IsTime, NULL, NULL},
 	{"parse_json", 2, 2, doFunc_parse_json, NULL, NULL},
-	{"get_property_by_key", 2, 2, doFunc_get_property_by_key, NULL, NULL},
+	{"get_property_by_dynkey", 2, 2, doFunc_get_property_by_dynkey, NULL, NULL},
 	{"script_error", 0, 0, doFunct_ScriptError, NULL, NULL},
 	{"previous_action_suspended", 0, 0, doFunct_PreviousActionSuspended, NULL, NULL},
 	{NULL, 0, 0, NULL, NULL, NULL} //last element to check end of array
