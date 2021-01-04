@@ -2317,6 +2317,9 @@ omhttp_get_data() {
         > ${RSYSLOG_OUT_LOG}
 }
 
+omhttp_validate_metadata_response() {
+	$PYTHON -c omhttp-validate-response.py --error ${RSYSLOG_DYNNAME}/omhttp.response.log --response ${RSYSLOG_DYNNAME}/omhttp.response.log
+}
 
 # prepare MySQL for next test
 # each test receives its own database so that we also can run in parallel

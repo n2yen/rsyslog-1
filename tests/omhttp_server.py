@@ -63,7 +63,8 @@ class MyHandler(BaseHTTPRequestHandler):
             return
 
         if metadata['posts'] > 1 and metadata['fail_every'] != -1 and metadata['posts'] % metadata['fail_every'] == 0:
-            self.send_response(500)
+            code = metadata['fail_with'] if metadata['fail_with'] else 500
+            self.send_response(code)
             self.end_headers()
             self.wfile.write(b'INTERNAL ERROR')
             return
@@ -113,12 +114,14 @@ if __name__ == '__main__':
     parser.add_argument('-i', '--interface', action='store', type=str, default='localhost', help='port')
     parser.add_argument('--fail-after', action='store', type=int, default=0, help='start failing after n posts')
     parser.add_argument('--fail-every', action='store', type=int, default=-1, help='fail every n posts')
+    parser.add_argument('--fail-with', action='store', type=int, default=500, help='on failure, fail with this code')
     parser.add_argument('--fail-with-400-after', action='store', type=int, default=-1, help='fail with 400 after n posts')
     parser.add_argument('--decompress', action='store_true', default=False, help='decompress posted data')
     parser.add_argument('--userpwd', action='store', default='', help='only accept this user:password combination')
     args = parser.parse_args()
     metadata['fail_after'] = args.fail_after
     metadata['fail_every'] = args.fail_every
+    metadata['fail_with'] = args.fail_with
     metadata['fail_with_400_after'] = args.fail_with_400_after
     metadata['decompress'] = args.decompress
     metadata['userpwd'] = args.userpwd

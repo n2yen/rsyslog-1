@@ -142,6 +142,9 @@ typedef struct instanceConf_s {
 	uchar *myPrivKeyFile;
 	sbool reloadOnHup;
 	sbool retryFailures;
+	sbool retryAddMetadata;
+	int nhttpRetryCodes;
+	unsigned int *httpRetryCodes;
 	unsigned int ratelimitInterval;
 	unsigned int ratelimitBurst;
 	/* for retries */
@@ -212,7 +215,9 @@ static struct cnfparamdescr actpdescr[] = {
 	{ "tls.mycert", eCmdHdlrString, 0 },
 	{ "tls.myprivkey", eCmdHdlrString, 0 },
 	{ "reloadonhup", eCmdHdlrBinary, 0 },
+	{ "httpretrycodes", eCmdHdlrArray, 0 },
 	{ "retry", eCmdHdlrBinary, 0 },
+	{ "retry.addmetadata", eCmdHdlrBinary, 0 },
 	{ "retry.ruleset", eCmdHdlrString, 0 },
 	{ "ratelimit.interval", eCmdHdlrInt, 0 },
 	{ "ratelimit.burst", eCmdHdlrInt, 0 },
@@ -317,6 +322,7 @@ CODESTARTfreeInstance
 	free(pData->caCertFile);
 	free(pData->myCertFile);
 	free(pData->myPrivKeyFile);
+	free(pData->httpRetryCodes);
 	free(pData->retryRulesetName);
 	if (pData->ratelimiter != NULL)
 		ratelimitDestruct(pData->ratelimiter);
@@ -382,7 +388,11 @@ CODESTARTdbgPrintInstInfo
 	dbgprintf("\ttls.mycert='%s'\n", pData->myCertFile);
 	dbgprintf("\ttls.myprivkey='%s'\n", pData->myPrivKeyFile);
 	dbgprintf("\treloadonhup='%d'\n", pData->reloadOnHup);
+	for(i = 0; i < pData->nhttpRetryCodes; ++i)
+		dbgprintf("%c'%d'", i == 0 ? '[' : ' ', pData->httpRetryCodes[i]);
+	dbgprintf("]\n");
 	dbgprintf("\tretry='%d'\n", pData->retryFailures);
+	dbgprintf("\tretry.addmetadata='%d'\n", pData->retryAddMetadata);
 	dbgprintf("\tretry.ruleset='%s'\n", pData->retryRulesetName);
 	dbgprintf("\tratelimit.interval='%u'\n", pData->ratelimitInterval);
 	dbgprintf("\tratelimit.burst='%u'\n", pData->ratelimitBurst);
@@ -743,6 +753,37 @@ finalize_it:
 }
 
 static rsRetVal
+msgAddResponseMetadata(smsg_t *const __restrict__ pMsg, wrkrInstanceData_t *const pWrkrData, size_t batch_index)
+{
+	struct json_object *json = NULL;
+	DEFiRet;
+	CHKmalloc(json = json_object_new_object());
+	/*
+		Following metadata is exposed:
+		$!omhttp!response!code
+		$!omhttp!response!body
+		$!omhttp!response!batch_index
+	*/
+	json_object_object_add(json, "code", json_object_new_int(pWrkrData->httpStatusCode));
+	if (pWrkrData->reply) {
+		json_object_object_add(json, "body", json_object_new_string(pWrkrData->reply));
+	}
+	json_object_object_add(json, "batch_index", json_object_new_int(batch_index));
+	CHKiRet(msgAddJSON(pMsg, (uchar*)"!omhttp!response", json, 0, 0));
+
+	/* TODO: possible future, an option to automatically parse to json?
+		would be under:
+		$!omhttp!response!parsed
+	*/
+
+finalize_it:
+	if (iRet != RS_RET_OK && json) {
+		json_object_put(json);
+	}
+	RETiRet;
+}
+
+static rsRetVal
 queueBatchOnRetryRuleset(wrkrInstanceData_t *const pWrkrData, instanceData *const pData)
 {
 	uchar *msgData;
@@ -769,6 +810,12 @@ queueBatchOnRetryRuleset(wrkrInstanceData_t *const pWrkrData, instanceData *cons
 
 		// And place it on the retry ruleset
 		MsgSetRuleset(pMsg, pData->retryRuleset);
+
+		// Add response specific metadata
+		if (pData->retryAddMetadata) {
+			CHKiRet(msgAddResponseMetadata(pMsg, pWrkrData, i));
+		}
+
 		ratelimitAddMsg(pData->ratelimiter, NULL, pMsg);
 
 		// Count here in case not entire batch succeeds
@@ -819,6 +866,23 @@ checkResult(wrkrInstanceData_t *pWrkrData, uchar *reqmsg)
 		STATSCOUNTER_INC(ctrHttpStatusSuccess, mutCtrHttpStatusSuccess);
 		STATSCOUNTER_ADD(ctrMessagesSuccess, mutCtrMessagesSuccess, numMessages);
 		iRet = RS_RET_OK;
+	}
+
+	/* when retriable codes are configured, always check status codes */
+	if (pData->nhttpRetryCodes) {
+		sbool bMatch = 0;
+		for (int i = 0; i < pData->nhttpRetryCodes; ++i) {
+			if (statusCode == pData->httpRetryCodes[i]) {
+				bMatch = 1;
+				break;
+			}
+		}
+		if (bMatch) {
+			/* just force retry */
+			iRet = RS_RET_SUSPENDED;
+		} else {
+			iRet = RS_RET_OK;
+		}
 	}
 
 	if (iRet != RS_RET_OK) {
@@ -1755,6 +1819,9 @@ setInstParamDefaults(instanceData *const pData)
 	pData->myPrivKeyFile = NULL;
 	pData->reloadOnHup= 0;
 	pData->retryFailures = 0;
+	pData->retryAddMetadata = 0;
+	pData->nhttpRetryCodes = 0;
+	pData->httpRetryCodes = NULL;
 	pData->ratelimitBurst = 20000;
 	pData->ratelimitInterval = 600;
 	pData->ratelimiter = NULL;
@@ -1907,10 +1974,26 @@ CODESTARTnewActInst
 			}
 		} else if(!strcmp(actpblk.descr[i].name, "reloadonhup")) {
 			pData->reloadOnHup= pvals[i].val.d.n;
+		} else if(!strcmp(actpblk.descr[i].name, "httpretrycodes")) {
+			pData->nhttpRetryCodes = pvals[i].val.d.ar->nmemb;
+			CHKmalloc(pData->httpRetryCodes = malloc(sizeof(unsigned int) * pvals[i].val.d.ar->nmemb ));
+			for(int j = 0 ; j <  pvals[i].val.d.ar->nmemb ; ++j) {
+				int bSuccess = 0;
+				long long n = es_str2num(pvals[i].val.d.ar->arr[j], &bSuccess);
+				if (!bSuccess) {
+					char *cstr = es_str2cstr(pvals[i].val.d.ar->arr[j], NULL);
+					LogError(0, RS_RET_NO_FILE_ACCESS,
+									 "error: 'httpRetryCode' is not a number: %s\n", cstr);
+					free(cstr);
+				}
+				pData->httpRetryCodes[j] = n;
+			}
 		} else if(!strcmp(actpblk.descr[i].name, "retry")) {
 			pData->retryFailures = pvals[i].val.d.n;
 		} else if(!strcmp(actpblk.descr[i].name, "retry.ruleset")) {
 			pData->retryRulesetName = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+		} else if(!strcmp(actpblk.descr[i].name, "retry.addmetadata")) {
+			pData->retryAddMetadata = pvals[i].val.d.n;
 		} else if(!strcmp(actpblk.descr[i].name, "ratelimit.burst")) {
 			pData->ratelimitBurst = (unsigned int) pvals[i].val.d.n;
 		} else if(!strcmp(actpblk.descr[i].name, "ratelimit.interval")) {
